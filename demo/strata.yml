@@ -1,0 +1,40 @@
+project_id: demo
+tenant_id: default
+
+state:
+  url: sqlite:///./.strata/state.db
+
+artifacts:
+  path: ./.strata/artifacts
+
+sources:
+  docs:
+    type: local_files
+    path: .
+    include: ["*.txt", "*.md", "*.pdf"]
+
+pipeline:
+  parsed:
+    source: docs
+    parser: liteparse
+    version: liteparse@0.1.0
+
+  chunks:
+    input: parsed
+    transform: fixed_token_chunker
+    version: fixed_token_chunker@0.1.0
+    config:
+      max_chars: 1200
+      overlap_chars: 120
+
+  embeddings:
+    input: chunks
+    transform: fake_embedding
+    version: fake_embedding@0.1.0
+    config:
+      dimensions: 16
+
+  sink:
+    input: embeddings
+    type: local_sqlite_vector_sink
+    version: sink@0.1.0
