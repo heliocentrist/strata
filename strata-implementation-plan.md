@@ -2,7 +2,7 @@
 
 *A build system for context: content-addressed, lineage-aware preparation of documents and other raw content for RAG pipelines, agent memory, and knowledge bases.*
 
-**Status:** Phase 0A implemented; Phase 0B reliability hardening implemented; Phase 1A selectors and Phase 1B local plugins implemented; Phase 2A tests and external plugin discovery implemented; host-staged ingest foundations partially implemented
+**Status:** Phase 0A implemented; Phase 0B reliability hardening implemented; Phase 1A selectors, Phase 1B generic operation plugins, and pluggable local operation runners implemented; Phase 2A tests and external operation discovery implemented; host-staged ingest foundations partially implemented
 **Author:** —
 **Last updated:** May 2026
 
@@ -14,9 +14,11 @@ Strata is to unstructured content what dbt is to SQL transformations: a build sy
 
 ### 1.1 Implementation checkpoint — May 2026
 
-Phase 0A now exists as a working local fixture. The package includes `compile`, `plan`, `apply`, `progress`, `lineage`, and `doctor`; SQLite state; local file sources; pipeline-configured parser plugins; deterministic chunking; fake deterministic embeddings; a local SQLite sink; operation progress; lineage; deletes; apply locks; and tests.
+Phase 0A now exists as a working local fixture. The package includes `compile`, `plan`, `apply`, `progress`, `lineage`, `doctor`, `test`, `inspect`, and `docs`; SQLite state; local file and object-manifest sources; pipeline-configured operation plugins; deterministic chunking; fake deterministic embeddings; a local SQLite sink; operation progress; lineage; deletes; apply locks; and tests.
 
-The artifact store design evolved during implementation. Fanout assets now use an Iceberg-inspired immutable snapshot model: payload JSONL files are immutable, fanout manifests are immutable and content-addressed, and the database is the catalog that commits asset instances to a specific manifest item. This replaces mutable per-child artifact JSON files and mutable `chunks.jsonl`/`embeddings.jsonl` files.
+The artifact store design evolved during implementation. Fanout assets now use an Iceberg-inspired immutable snapshot model: payload JSONL files are immutable, fanout manifests are immutable and content-addressed, and the database is the catalog that commits asset instances to a specific manifest item. The physical artifact layout is behind an artifact collection plugin (`local_json`) rather than hard-coded in the core.
+
+Apply semantics now live in the Strata runtime, not in executor plugins. Execution substrate is selected through an operation-runner registry. The built-in runners are `local_single_thread` and `local_threaded`; both share the same Strata cache/lineage/artifact commit semantics, while `local_threaded` parallelizes plugin invocations where the runtime can safely batch them.
 
 ---
 
@@ -46,7 +48,7 @@ The market research (conducted separately) confirms no existing tool combines (a
 2. **Content-addressed, surgical reprocessing.** A change to a source document, a transform version, or a config value invalidates exactly the affected downstream artifacts and nothing else. `plan` shows the diff before `apply` executes it.
 3. **dbt-grade developer ergonomics.** A declarative project, a compiled manifest, a node-selector grammar (`state:modified+`, `+asset`, `source:foo+`), plan-before-apply, asset-level tests, and a lineage/docs site.
 4. **Substrate-agnostic.** Bring your own parser (LiteParse, LlamaParse, Reducto, Docling, Unstructured, Marker), embedding model, vector store, object store, and metadata DB. Strata orchestrates; it does not reimplement these.
-5. **Execution-engine-agnostic.** Strata computes *what* to do; a pluggable executor decides *how*. A local executor ships first; adapters for Temporal, Dagster, and Prefect follow. Strata must be embeddable inside an existing orchestrator, not a replacement for one.
+5. **Execution-engine-agnostic.** Strata computes *what* to do and owns the apply semantics; a pluggable operation runner decides where plugin invocations run. Local runners ship first; Temporal, Dagster, and Prefect runners follow. Strata must be embeddable inside an existing orchestrator, not a replacement for one.
 6. **Batch first, streaming-ready.** Batch corpus ingest is the v1 workload. The source and state abstractions must not preclude streaming ingest (agent memory) later, even though streaming execution is out of scope for v1.
 7. **Multi-tenant-capable.** The data model must support per-tenant isolation of assets and lineage from the start, since the canonical early workloads are multi-tenant SaaS KB systems.
 
@@ -55,7 +57,7 @@ The market research (conducted separately) confirms no existing tool combines (a
 1. **Not a parser.** Strata never reimplements document parsing or OCR. It wraps and version-pins external parsers.
 2. **Not an embedding model or vector store.** These are sinks and dependencies, not Strata's concern.
 3. **Not an agent framework or LLM orchestration layer.** Strata prepares context; it does not run agents, manage prompts at runtime, or compete with LangChain/LlamaIndex agent abstractions.
-4. **Not a durable execution engine.** Strata does not reimplement Temporal. Durability, retries, and scheduling are delegated to the executor.
+4. **Not a durable execution engine.** Strata does not reimplement Temporal. Durable scheduling of plugin invocations can be delegated to an operation runner, while Strata still owns cache checks, artifact commits, lineage, and state transitions.
 5. **Not a standalone hosted platform (yet).** v1 is an open-source library. A hosted control plane is a later-phase consideration, not part of the core design.
 6. **Not a general-purpose data orchestrator.** Strata is deliberately domain-specific to content/context preparation. Pachyderm's general-purpose content-addressed pipelines never crossed the AI chasm; domain specificity is the bet.
 
@@ -81,7 +83,7 @@ These are the load-bearing commitments. When a design decision is unclear, these
 
 8. **Plan before apply, always.** No command mutates state or spends money without first producing a plan the user (or calling system) can inspect: what is stale, why, known counts, unknown fanout, and estimated cost where honest. This is Terraform's model adapted for content pipelines where some exact child instances are unknowable before execution.
 
-9. **Opinionated core, pluggable edges.** The core (manifest, planner, fingerprinting, state model, selector grammar) is small and opinionated. The edges (parsers, embedders, vector stores, executors, state backends) are plugins behind narrow interfaces. Resist growing the core.
+9. **Opinionated core, pluggable edges.** The core (manifest, planner, fingerprinting, state model, selector grammar, apply semantics) is small and opinionated. The edges (sources, operations, artifact collections, operation runners, state backends, object stores) are plugins behind narrow interfaces. Resist growing the core.
 
 10. **Cheap to be wrong.** Every phase delivers standalone value so that stopping at any phase is still a win. The first internal workload benefits before any framework abstraction is formalized.
 
@@ -327,7 +329,51 @@ The planning layer is pure and sits between compilation and execution. It receiv
 
 This is what allows: exhaustive unit testing of planning logic with no infrastructure; swapping executors without touching planning; and eventual extraction of Strata from any host system.
 
-For 1-to-many transforms, the planner emits coarse operations such as "build chunks for parsed/docA". It does not run the chunker to discover exact output chunks. The executor expands those coarse operations during `apply`, writes exact asset instances, and records lineage.
+For transforms whose exact outputs are not knowable before execution, the planner emits coarse operations such as "build chunks for parsed/docA". It does not run the operation plugin to discover exact output instances. During `apply`, the runtime binds input groups from `source`, `input`, or named `inputs`, invokes the plugin through the selected operation runner, flatmaps returned outputs into exact asset instances, and records lineage.
+
+Important boundary correction: Strata's apply semantics are not pluggable executor behavior. The runtime always owns dependency layers, input binding, cache checks, fingerprinting, artifact writes, state commits, lineage, operation item progress, source state, checkpoints, and delete semantics. The pluggable boundary is the async `OperationRunner`, which decides where bounded windows of `OperationPlugin.run(...)` invocations execute: inline, in a local thread pool, or later as Temporal/Dagster activities.
+
+The executable plugin contract is now operation-shaped rather than parser/chunker/embedder/sink-shaped. A pipeline asset names one `operation`; the operation receives a list of `OperationInput` objects and returns a list of `OperationOutput` objects. This means one-to-one, one-to-many, many-to-one, and many-to-many work all use the same call shape. Each input has a stable `input_id`; outputs may declare `parent_input_ids` so batched plugin calls can still commit precise fingerprints and lineage. The runtime is responsible for grouping inputs from the DAG, reading/writing artifact collections, computing fingerprints, cache checks, and recording lineage. Plugins are responsible for domain work only.
+
+```python
+class OperationPlugin(Protocol):
+    def run(
+        self,
+        inputs: list[OperationInput],
+        config: dict[str, Any],
+    ) -> list[OperationOutput]:
+        ...
+```
+
+Assets may opt into larger plugin calls with `execution.inputs_per_call`. The minimum is `1`. This lets an embedding operation receive many chunk inputs in one sync plugin call while the runtime still commits each returned embedding as its own asset instance. Separately, `execution.window_size` controls how many invocation batches the runtime hands to the async runner before waiting and committing results. Windows are formed across the whole asset dependency layer, not only within a single source-scoped planned operation, so small inputs from many source items can still fill efficient runner windows. Artifact outputs returned by a window are grouped by partition before writing, so the local artifact collection writes one payload/manifest pair per window/partition instead of one pair per output item. Runners may do their own lower-level batching, concurrency, and activity scheduling inside each window.
+
+Pipeline YAML is therefore operation-centric:
+
+```yaml
+pipeline:
+  parsed:
+    source: docs
+    operation: liteparse
+
+  chunks:
+    input: parsed
+    operation: fixed_token_chunker
+    config:
+      output_label: chunk
+
+  embeddings:
+    input: chunks
+    operation: fake_embedding
+    execution:
+      inputs_per_call: 128
+      window_size: 1000
+
+  sink:
+    inputs:
+      chunk: chunks
+      embedding: embeddings
+    operation: local_sqlite_vector_sink
+```
 
 ### 6.3 Surface API sketch (Python)
 
@@ -408,7 +454,7 @@ AssetInputScope
 
 Exact instance-level work is an execution detail. The operation model can later grow exact `build_instance` operations for assets whose output instances are fully knowable during planning.
 
-During `apply`, coarse operations may expand into durable `operation_items`. These are not final artifacts. They are per-run work records used for progress, retry, and resume. For example, a SharePoint source operation can expand into one operation item per enumerated file, and a chunking operation can expand into one operation item per produced chunk before final `asset_instances` are committed.
+During `apply`, coarse operations may expand into durable `operation_items`. These are not final artifacts. They are per-run work records used for progress, retry, and resume. For example, a SharePoint source operation can create one operation item per enumerated file, and a chunking operation can create one operation item per produced chunk before final `asset_instances` are committed.
 
 ### 6.6 Command semantics
 
@@ -437,7 +483,7 @@ During `apply`, coarse operations may expand into durable `operation_items`. The
 6. Persists planned operations to `operation_runs`.
 7. Executes operations in topological order.
 8. Re-checks cache before running each operation against latest committed state.
-9. Expands source/fanout operations during execution and writes `operation_items` for durable progress/resume.
+9. Binds input groups, runs operation plugins, flatmaps returned outputs, and writes `operation_items` for durable progress/resume.
 10. Fetches short-lived source access material, such as download URLs, just in time during execution rather than storing it in source snapshots.
 11. Computes fingerprints using canonical JSON + SHA-256.
 12. Writes outputs before marking asset instances `materialized`.
@@ -646,13 +692,15 @@ Future built-ins:
 
 Manifests are commit markers for bundled writes: payload files are written first; the manifest is written last and is the addressable record used by state.
 
-#### 6.9.5 Multi-input hybrid sink contracts
+**Current implementation:** artifact collection protocols and registry are implemented. `local_json` is registered as the built-in collection. Single-output assets currently use one JSON file per instance; fanout assets use one JSONL payload plus an immutable timestamped manifest per parent/partition. The database stores the collection-returned address and hashes. More compact strategies for high-volume single-output assets, such as JSONL or Parquet bundles, remain deferred.
+
+#### 6.9.5 Multi-input operation contracts
 
 Hybrid search indexes usually need one physical document per chunk containing both lexical text and vector embedding. Model this as one logical sink asset with named inputs:
 
 ```yaml
 search_index:
-  type: elasticsearch_hybrid_sink
+  operation: elasticsearch_hybrid_sink
   version: elasticsearch_hybrid_sink@0.1.0
   inputs:
     chunk: chunks
@@ -665,25 +713,21 @@ search_index:
     index: search_chunks
 ```
 
-The sink adapter should not crawl Strata internals. Instead:
+The operation should not crawl Strata internals. Instead:
 
-- The sink declares the input contract it supports.
+- The pipeline declares named inputs.
 - The executor resolves that contract from the DAG and lineage.
-- The executor reads chunk and embedding artifacts and constructs a typed sink item.
-- The sink adapter writes the physical index document and returns an output location/hash.
+- The executor reads chunk and embedding artifacts and passes them as role-tagged `OperationInput` values.
+- The operation writes the physical index document and returns an `OperationOutput` with output location/hash.
 - Strata records lineage edges from both chunk and embedding instances to the sink instance.
 
-Conceptual item passed to the sink:
+Conceptual inputs passed to the sink:
 
 ```python
-HybridChunkEmbeddingItem(
-    context=ExecutionContext(...),
-    source=SourceRef(...),
-    chunk=ChunkRef(text=..., fingerprint=..., content_hash=..., metadata=...),
-    embedding=EmbeddingRef(vector=..., fingerprint=..., content_hash=..., metadata=...),
-    document_id="tenant:project:source:drive:item#chunk:0003",
-    metadata={...},
-)
+[
+    OperationInput(role="chunk", asset_name="chunks", data="...", input_fingerprint="..."),
+    OperationInput(role="embedding", asset_name="embeddings", data=[...], input_fingerprint="..."),
+]
 ```
 
 Delete behavior should be part of the sink contract:
@@ -796,7 +840,7 @@ The existing `-p strata.yml` path remains for local projects. The new state/proj
 - Update local sink or add a fake hybrid search sink test double.
 - Record sink lineage from both chunk and embedding.
 
-**Current implementation:** named sink inputs, hybrid chunk+embedding sink item models, executor-side lineage join, local sink hybrid write result, and sink lineage from both chunk and embedding are implemented.
+**Current implementation:** named operation inputs, executor-side lineage join, role-tagged `OperationInput` values, generic `OperationOutput` results, and sink lineage from both chunk and embedding are implemented.
 
 **Milestone E — Search index sink**
 
@@ -812,11 +856,11 @@ The existing `-p strata.yml` path remains for local projects. The new state/proj
 - Support CLI/docs/inspect/progress by `--state-url + --project-id + --tenant-id` or `--project-name`.
 - Add docs browser support for project registry lookup.
 
-**Milestone G — Executor adapter later**
+**Milestone G — Operation runner adapter later**
 
 - Keep the first host integration as one host activity/job calling Strata as a library.
 - Add activity heartbeats/cancellation checks around Strata progress if needed.
-- Only after this is proven, add Temporal/Dagster executors that map Strata operations and operation items onto native activities.
+- Only after this is proven, add Temporal/Dagster operation runners that map plugin invocations onto native activities while the Strata runtime keeps cache, lineage, artifact commit, and progress semantics.
 
 #### 6.9.8 Test host fixture
 
@@ -895,7 +939,7 @@ Each phase ships standalone value. Stopping after any phase is a coherent outcom
 - Implement stable logical instance keys for fanout assets. Phase 0 chunks use `parent_instance_key + ordinal`; chunk content hash is stored separately for future embedding reuse.
 - Implement pure `plan(manifest, current_state, source_snapshot, selection) -> operations`.
 - Implement typed coarse operations: `build_scope` and `delete_scope`.
-- Implement a local executor that expands source/fanout work during apply, writes `operation_items` for progress/resume, writes asset instance state, and records lineage.
+- Implement a local apply runtime that binds operation inputs, invokes plugins through the selected runner, writes `operation_items` for progress/resume, writes asset instance state, and records lineage.
 - Implement source checkpoints and source scope hashing, even if the local file source only uses a simple filesystem scan marker.
 - Implement apply locking with at most one active apply per `(project_id, tenant_id)`, while allowing different project/tenant scopes to run concurrently.
 - Implement confirmed-delete behavior: remove sink rows immediately, mark downstream asset instances `deleted`, and retain tombstoned lineage.
@@ -936,25 +980,42 @@ Each phase ships standalone value. Stopping after any phase is a coherent outcom
 
 - Minimal selector grammar: `asset`, `asset+`, `+asset`, `+asset+`, and `source:x+`.
 - Local plugin registry for built-in parser, chunker, embedder, and sink adapters.
-- Pipeline-level parser selection, so document parser behavior is configured in the project manifest instead of by CLI extras.
+- Pipeline-level operation selection, so parser/chunker/embedder/sink behavior is configured in the project manifest instead of by CLI extras.
+- Manifest-level operation-runner selection:
+  ```yaml
+  execution:
+    executor: local_threaded
+    config:
+      max_workers: 4
+  ```
 - Python decorator surface (`@asset`, `@source`, `Config`).
 - Project compilation → manifest.
-- Local executor with topological scheduling, coarse-operation expansion, and per-instance caching.
+- Pluggable operation-runner registry with local single-thread and local threaded runners.
+- Strata runtime with dependency-safe scheduling, generic input binding, flatmap output materialization, per-instance caching, artifact commits, and lineage.
 - Extended selector grammar: `tag:y`, `state:modified+`.
 - `strata compile | plan | apply | ls`.
-- Built-in plugins for one of each: one parser (LiteParse), one chunker, one embedder, one sink (pgvector or Qdrant), plus Postgres state backend after the Phase 0 SQLite backend.
+- Built-in operation plugins for one of each: one parser (LiteParse), one chunker, one embedder, one sink (pgvector or Qdrant), plus Postgres state backend after the Phase 0 SQLite backend.
 
 **Exit criterion:** A new user can define a RAG ingest pipeline in <50 lines, run `strata plan` / `strata apply`, change a config, and see surgical reprocessing — all without a host orchestrator.
 
 **Current status:** Phase 1A minimal selectors are implemented. `--select/-s` supports `asset`, `asset+`, `+asset`, `+asset+`, comma-separated asset terms, and `source:x+`. The old `--asset` option remains as a backward-compatible alias for `asset+`.
 
-Phase 1B local plugin registry is implemented. The executor dispatches parsers, chunkers, embedders, and sinks through named in-process registries. Built-in parser plugins are registered for `markdown_noop` and `liteparse` (`auto` currently aliases `liteparse`). `markdown_noop` accepts only `.md` files. `liteparse` reads `.txt` and `.md` directly and parses `.pdf` through LiteParse. Built-ins are also registered for `fixed_token_chunker`, `fake_embedding`, and `local_sqlite_vector_sink`. External package discovery and entry points are deferred.
+Phase 1B local plugin registry is implemented around a generic operation interface. The runtime dispatches every executable asset through the named `operation` registry. Built-in operation plugins are registered for `markdown_noop`, `liteparse` (`auto` currently aliases `liteparse`), `fixed_token_chunker`, `fake_embedding`, and `local_sqlite_vector_sink`. `markdown_noop` accepts only `.md` files. `liteparse` reads `.txt` and `.md` directly and parses `.pdf` through LiteParse.
+
+The planner no longer hardcodes the canonical `parsed -> chunks -> embeddings -> sink` asset names. Asset ordering is compiled from the declared DAG, and the planner emits generic `build_scope` / `delete_scope` operations from asset dependencies and current state. Runtime input binding is inferred from the asset declaration shape: `source`, `input`, or named `inputs`. Plugin metadata no longer declares map/fanout/sink shape; every operation is executed through the same flatmap-style `OperationInput` / `OperationOutput` contract. Per-asset `execution.inputs_per_call` lets the runtime pass multiple compatible inputs into one plugin call; outputs use `parent_input_ids` to preserve exact lineage.
+
+Pluggable operation-runner selection is implemented. `ExecutionSpec` is part of the manifest, `strata.yml` supports an `execution:` block, and the CLI/API dispatch through an operation-runner registry. Built-ins:
+
+- `local_single_thread` runs plugin invocations inline.
+- `local_threaded` uses a `ThreadPoolExecutor` and `max_workers` from execution config for safely batched plugin invocations.
+
+The runtime still owns apply semantics for both runners: dependency layers, input binding, layer-level runtime windows, cache checks, fingerprints, artifact writes, lineage, operation item status, source state, checkpoints, and delete behavior. The runner only executes bounded windows of `OperationPlugin.run(...)` calls. The current threaded runner parallelizes safely batched plugin invocations within those windows; dependency ordering, output materialization, and commit semantics remain runtime concerns.
 
 ### Phase 2 — Ergonomics and trust
 
 **Goal:** The things that make people trust it in production.
 
-- External plugin discovery via Python package entry points, so parser/chunker/embedder/sink plugins can ship outside the core package.
+- External plugin discovery via Python package entry points, so operation/source/artifact/executor plugins can ship outside the core package.
 - Plugin metadata and compatibility checks: plugin type, supported asset kinds, config schema, dependency requirements, and declared Strata API version.
 - `strata test` — asset-level assertions (no empty chunks, embedding dims match model, parent_doc_id present, ≥X% of docs produced chunks).
 - `strata inspect` — CLI-first per-instance debug view showing fingerprints, transform/config identity, artifact preview, upstream lineage, and downstream sink linkage.
@@ -965,7 +1026,7 @@ Phase 1B local plugin registry is implemented. The executor dispatches parsers, 
 
 **Exit criterion:** A team can debug "why is this chunk in the results" via the docs UI, and trust `plan` to tell the truth about rebuild scope before running apply.
 
-**Current status:** Phase 2A is implemented. External parser/chunker/embedder/sink discovery uses Python entry point groups (`strata.parsers`, `strata.chunkers`, `strata.embedders`, `strata.sinks`) and records basic plugin metadata. `strata test` is implemented with declarative YAML tests and built-in assertions for materialized assets, non-empty artifacts, embedding dimensions, and source identity metadata.
+**Current status:** Phase 2A is implemented. External operation discovery uses the Python entry point group `strata.operations` and records basic plugin metadata. `strata test` is implemented with declarative YAML tests and built-in assertions for materialized assets, non-empty artifacts, embedding dimensions, and source identity metadata.
 
 Phase 2B is implemented as a CLI-first inspection layer. `strata inspect` assembles state rows, transform metadata, lineage edges, artifact payload previews, embedding dimensions, and local sink linkage into a human-readable or JSON report.
 
@@ -975,18 +1036,31 @@ Future docs enhancement: add an interactive lineage graph view for the selected 
 
 Richer test plugins and stronger compatibility enforcement remain deferred.
 
-### Phase 3 — Executor adapters and scale
+### Phase 3 — Operation runners and scale
 
 **Goal:** Fit into how teams already run things.
 
-- Executor adapters: Temporal (durability/retries/scheduling), Dagster (`dagster-strata`), Prefect.
+- Operation runner adapters: Temporal (durability/retries/scheduling), Dagster (`dagster-strata`), Prefect.
+- Temporal runner should map plugin invocations onto native workflow/activity boundaries while the Strata runtime preserves fingerprints, lineage, artifact commits, and retryable item state.
+- Threaded local execution can later be refined once manifest assembly and partial fanout retry semantics are explicit.
+- Sink operations should support batched writes. The current local sink commits one external output at a time, which is acceptable for the fixture but wrong for Elasticsearch/OpenSearch/vector DB adapters. The sink contract should let a window produce many sink writes and commit them with bulk insert/upsert/delete APIs while still recording one `asset_instance` and lineage set per logical sink output.
 - Artifact store abstraction (local fs + S3) so intermediate artifacts (parsed markdown, chunk parquet) are the source of truth and the vector store is a rebuildable downstream sink.
 - (To consider) Option to use Iceberg as storage.
+- Future artifact storage research:
+  - Parquet-backed artifact collections for high-volume parsed/chunk/embedding assets.
+  - File-level manifests that point to Parquet/JSONL data files instead of listing every item inline.
+  - Operation-run output group manifests under `artifacts/{asset_name}/{partition_hash}/manifests/{timestamp}-{hash}.json`.
+  - Optional compaction from many small operation outputs into larger files.
+  - Clear output location format for bundled records.
+  - Hash/state simplification once DB-as-SSOT plus bundled artifact storage is proven.
+  These are deliberately deferred until the artifact storage model is clearer.
 - Cost estimation in `plan` for paid parser, embedding, and LLM operations, using plugin-provided estimators where available.
 - Per-asset scheduling (re-embed daily, re-summarize weekly) expressed declaratively. Scheduling should be optional, because a lot of use cases will have Strata runs orchestrated by external scheduler.
 - Multi-tenant and multi-project operations hardened (isolation, per-tenant/project plan/apply, bulk reprocessing across tenants).
 
 **Exit criterion:** Strata runs as the build-system layer on top of an existing Temporal or Dagster deployment, not as a replacement for it.
+
+**Current status:** Apply semantics live in `strata.execution.apply`. The sync public apply API wraps an async apply runtime. The async operation runner protocol and registry are implemented. `local_single_thread` and `local_threaded` are implemented and selectable from `strata.yml`. The runtime executes dependency layers, forms bounded windows across all source-scoped operations in that layer, hands each window to the runner, and commits each returned window before continuing. Temporal/Dagster/Prefect runners remain the next execution-substrate milestone.
 
 ### Phase 4 — Memory and knowledge-base asset types
 
@@ -1011,7 +1085,7 @@ These decisions are locked for Phase 0 and should be treated as the implementati
 
 1. **Plan is quick, pure, and honest.** The planner does not run transforms. For fanout assets, it emits coarse scoped operations and marks exact child counts as unknown or estimated.
 
-2. **Apply expands fanout.** The executor turns coarse operations into exact asset instances during `apply`, after running transforms such as chunkers.
+2. **Apply materializes plugin outputs.** The runtime turns coarse operations into input groups, runs operation plugins through the selected runner, flatmaps returned outputs into exact asset instances, and records lineage.
 
 3. **State is scoped by project and tenant.** Every project-scoped state table includes required `project_id` and `tenant_id`, defaulting both to `"default"`. A tenant can have multiple projects.
 
@@ -1031,7 +1105,7 @@ These decisions are locked for Phase 0 and should be treated as the implementati
 
 11. **Run and operation history exist from the start.** `runs` and `operation_runs` are part of Phase 0, not later observability work.
 
-12. **Apply-expanded work items exist from the start.** `operation_items` are the durable per-run records for expanded source/fanout work. They power progress, retry, and resume, but they are not reusable artifacts.
+12. **Apply-expanded work items exist from the start.** `operation_items` are the durable per-run records for source/input-group/output work discovered during apply. They power progress, retry, and resume, but they are not reusable artifacts.
 
 13. **Source checkpoints are first-class state.** Connector cursors and scope hashes live in `source_checkpoints`. Per-item hashes and delete markers live in `source_state`.
 

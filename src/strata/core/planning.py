@@ -1,7 +1,10 @@
-﻿from __future__ import annotations
+from __future__ import annotations
+
+from dataclasses import dataclass
 
 from strata.core.hashing import config_hash, input_fingerprint
 from strata.core.models import (
+    AssetSpec,
     CurrentState,
     Manifest,
     Operation,
@@ -12,6 +15,12 @@ from strata.core.models import (
 from strata.core.selectors import parse_selection
 
 
+@dataclass(frozen=True)
+class _ExpectedInstance:
+    instance_key: str
+    input_fingerprint: str
+
+
 def plan(
     manifest: Manifest,
     current_state: CurrentState,
@@ -20,7 +29,6 @@ def plan(
 ) -> list[Operation]:
     selected = parse_selection(manifest, selection)
     operations: list[Operation] = []
-
     source_items = {
         (snapshot.source_name, item.item_key): item
         for snapshot in source_snapshots.values()
@@ -31,24 +39,16 @@ def plan(
         for snapshot in source_snapshots.values()
         if snapshot.mode == SourceSnapshotMode.AUTHORITATIVE
     }
-
     for source_name, item_key in sorted(source_items):
         if selected.source_names is not None and source_name not in selected.source_names:
             continue
         item = source_items[(source_name, item_key)]
         if item.deleted:
-            if "sink" in selected.assets:
-                operations.append(
-                    _operation(
-                        manifest,
-                        op_type="delete_scope",
-                        asset_name="sink",
-                        item_key=item_key,
-                        source_name=source_name,
-                        reason="source_deleted",
-                    )
-                )
+            operations.extend(
+                _delete_operations_for_source(manifest, selected.assets, source_name, item_key)
+            )
             continue
+
         old_hash = current_state.source_hashes.get((source_name, item_key))
         if old_hash is None:
             root_reason = "new_source"
@@ -57,108 +57,34 @@ def plan(
         else:
             root_reason = ""
 
-        parsed_asset = manifest.assets["parsed"]
-        parsed_fingerprint = input_fingerprint(
-            transform_version=parsed_asset.version,
-            config_hash_value=config_hash(parsed_asset.config),
-            determinism=parsed_asset.determinism.value,
-            instance_key=item_key,
-            source_content_hash=item.content_hash,
-        )
-        parsed_current = ("parsed", item_key, parsed_fingerprint) in current_state.materialized
-        parsed_reason = root_reason or ("" if parsed_current else "missing_cached_instance")
-
-        first_chunk_key = f"{item_key}#chunk:0000"
-        chunks_asset = manifest.assets["chunks"]
-        chunks_fingerprint = input_fingerprint(
-            transform_version=chunks_asset.version,
-            config_hash_value=config_hash(chunks_asset.config),
-            determinism=chunks_asset.determinism.value,
-            instance_key=first_chunk_key,
-            upstream_fingerprints=[parsed_fingerprint],
-        )
-        chunks_current = (
-            "chunks",
-            first_chunk_key,
-            chunks_fingerprint,
-        ) in current_state.materialized
-        chunks_reason = root_reason or ("" if chunks_current else "config_or_cache_changed")
-
-        embeddings_asset = manifest.assets["embeddings"]
-        embeddings_fingerprint = input_fingerprint(
-            transform_version=embeddings_asset.version,
-            config_hash_value=config_hash(embeddings_asset.config),
-            determinism=embeddings_asset.determinism.value,
-            instance_key=first_chunk_key,
-            upstream_fingerprints=[chunks_fingerprint],
-        )
-        embeddings_current = (
-            "embeddings",
-            first_chunk_key,
-            embeddings_fingerprint,
-        ) in current_state.materialized
-        embeddings_reason = root_reason or chunks_reason or (
-            "" if embeddings_current else "config_or_cache_changed"
-        )
-
-        sink_asset = manifest.assets["sink"]
-        sink_fingerprint = input_fingerprint(
-            transform_version=sink_asset.version,
-            config_hash_value=config_hash(sink_asset.config),
-            determinism=sink_asset.determinism.value,
-            instance_key=first_chunk_key,
-            upstream_fingerprints=[chunks_fingerprint, embeddings_fingerprint],
-        )
-        sink_current = ("sink", first_chunk_key, sink_fingerprint) in current_state.materialized
-        sink_reason = root_reason or embeddings_reason or (
-            "" if sink_current else "config_or_cache_changed"
-        )
-
-        if parsed_reason and "parsed" in selected.assets:
-            operations.append(
-                _operation(
-                    manifest,
-                    op_type="build_scope",
-                    asset_name="parsed",
-                    item_key=item_key,
-                    source_name=source_name,
-                    reason=parsed_reason,
-                    count=1,
+        expected: dict[str, _ExpectedInstance] = {}
+        reasons: dict[str, str] = {}
+        for asset_name in manifest.asset_order:
+            asset = manifest.assets[asset_name]
+            if not _asset_applies_to_source(manifest, asset, source_name):
+                continue
+            expected_instance = _expected_instance(asset, item_key, item.content_hash, expected)
+            expected[asset_name] = expected_instance
+            upstream_reason = _upstream_reason(asset, reasons)
+            current = (
+                asset_name,
+                expected_instance.instance_key,
+                expected_instance.input_fingerprint,
+            ) in current_state.materialized
+            reason = root_reason or upstream_reason or ("" if current else _missing_reason(asset))
+            reasons[asset_name] = reason
+            if reason and asset_name in selected.assets:
+                operations.append(
+                    _operation(
+                        manifest,
+                        op_type="build_scope",
+                        asset_name=asset_name,
+                        item_key=item_key,
+                        source_name=source_name,
+                        reason=reason,
+                        count=1 if asset.source else None,
+                    )
                 )
-            )
-        if chunks_reason and "chunks" in selected.assets:
-            operations.append(
-                _operation(
-                    manifest,
-                    op_type="build_scope",
-                    asset_name="chunks",
-                    item_key=item_key,
-                    source_name=source_name,
-                    reason=chunks_reason,
-                )
-            )
-        if embeddings_reason and "embeddings" in selected.assets:
-            operations.append(
-                _operation(
-                    manifest,
-                    op_type="build_scope",
-                    asset_name="embeddings",
-                    item_key=item_key,
-                    source_name=source_name,
-                    reason=embeddings_reason,
-                )
-            )
-        if sink_reason and "sink" in selected.assets:
-            operations.append(
-                _operation(
-                    manifest,
-                    op_type="build_scope",
-                    asset_name="sink",
-                    item_key=item_key,
-                    source_name=source_name,
-                    reason=sink_reason,
-                )
-            )
 
     current_source_keys = set(current_state.source_hashes)
     observed_keys = {key for key, item in source_items.items() if not item.deleted}
@@ -167,21 +93,109 @@ def plan(
             continue
         if selected.source_names is not None and source_name not in selected.source_names:
             continue
-        if "sink" in selected.assets:
-            operations.append(
-                _operation(
-                    manifest,
-                    op_type="delete_scope",
-                    asset_name="sink",
-                    item_key=item_key,
-                    source_name=source_name,
-                    reason="source_deleted",
-                )
-            )
+        operations.extend(
+            _delete_operations_for_source(manifest, selected.assets, source_name, item_key)
+        )
 
     if not operations:
         return []
-    return _with_dependencies(operations)
+    return _with_dependencies(manifest, operations)
+
+
+def _asset_applies_to_source(manifest: Manifest, asset: AssetSpec, source_name: str) -> bool:
+    if asset.source:
+        return asset.source == source_name
+    upstream_names = _asset_dependencies(asset)
+    return any(
+        _asset_applies_to_source(manifest, manifest.assets[name], source_name)
+        for name in upstream_names
+    )
+
+
+def _expected_instance(
+    asset: AssetSpec,
+    source_item_key: str,
+    source_content_hash: str,
+    expected: dict[str, _ExpectedInstance],
+) -> _ExpectedInstance:
+    cfg_hash = config_hash(asset.config)
+    if asset.source:
+        instance_key = source_item_key
+        fingerprint = input_fingerprint(
+            transform_version=asset.version,
+            config_hash_value=cfg_hash,
+            determinism=asset.determinism.value,
+            instance_key=instance_key,
+            source_content_hash=source_content_hash,
+        )
+        return _ExpectedInstance(instance_key=instance_key, input_fingerprint=fingerprint)
+
+    upstreams = [expected[name] for name in _asset_dependencies(asset)]
+    if not upstreams:
+        raise ValueError(f"asset {asset.name} has no expected upstream instance")
+    output_label = asset.config.get("output_label")
+    if isinstance(output_label, str) and output_label:
+        instance_key = _fanout_instance_key(source_item_key, output_label, 0)
+    else:
+        instance_key = upstreams[0].instance_key
+    fingerprint = input_fingerprint(
+        transform_version=asset.version,
+        config_hash_value=cfg_hash,
+        determinism=asset.determinism.value,
+        instance_key=instance_key,
+        upstream_fingerprints=[upstream.input_fingerprint for upstream in upstreams],
+    )
+    return _ExpectedInstance(instance_key=instance_key, input_fingerprint=fingerprint)
+
+
+def _asset_dependencies(asset: AssetSpec) -> list[str]:
+    if asset.inputs:
+        return list(dict(sorted(asset.inputs.items())).values())
+    if asset.input:
+        return [asset.input]
+    return []
+
+
+def _upstream_reason(asset: AssetSpec, reasons: dict[str, str]) -> str:
+    for upstream_name in _asset_dependencies(asset):
+        reason = reasons.get(upstream_name, "")
+        if reason:
+            return reason
+    return ""
+
+
+def _missing_reason(asset: AssetSpec) -> str:
+    if asset.source:
+        return "missing_cached_instance"
+    return "config_or_cache_changed"
+
+
+def _delete_operations_for_source(
+    manifest: Manifest, selected_assets: set[str], source_name: str, item_key: str
+) -> list[Operation]:
+    return [
+        _operation(
+            manifest,
+            op_type="delete_scope",
+            asset_name=asset.name,
+            item_key=item_key,
+            source_name=source_name,
+            reason="source_deleted",
+        )
+        for asset in _terminal_assets(manifest)
+        if asset.name in selected_assets
+    ]
+
+
+def _terminal_assets(manifest: Manifest) -> list[AssetSpec]:
+    depended_on = {
+        dependency
+        for asset in manifest.assets.values()
+        for dependency in _asset_dependencies(asset)
+    }
+    terminals = [asset for asset in manifest.assets.values() if asset.name not in depended_on]
+    sink_terminals = [asset for asset in terminals if asset.kind == "sink"]
+    return sink_terminals or terminals
 
 
 def _operation(
@@ -208,15 +222,15 @@ def _operation(
     )
 
 
-def _with_dependencies(operations: list[Operation]) -> list[Operation]:
+def _with_dependencies(manifest: Manifest, operations: list[Operation]) -> list[Operation]:
     by_item: dict[str, list[Operation]] = {}
     for operation in operations:
         by_item.setdefault(operation.scope.item_key or "", []).append(operation)
 
-    order = {"parsed": 0, "chunks": 1, "embeddings": 2, "sink": 3}
+    order = {asset_name: index for index, asset_name in enumerate(manifest.asset_order)}
     sorted_ops: list[Operation] = []
     for item_key in sorted(by_item):
-        item_ops = sorted(by_item[item_key], key=lambda op: order.get(op.asset_name, 99))
+        item_ops = sorted(by_item[item_key], key=lambda op: order.get(op.asset_name, 9999))
         previous: Operation | None = None
         for operation in item_ops:
             if previous and operation.op_type == "build_scope":
@@ -224,3 +238,7 @@ def _with_dependencies(operations: list[Operation]) -> list[Operation]:
             sorted_ops.append(operation)
             previous = operation
     return sorted_ops
+
+
+def _fanout_instance_key(source_item_key: str, label: str, ordinal: int) -> str:
+    return f"{source_item_key}#{label}:{ordinal:04d}"

@@ -51,7 +51,15 @@ def _parse_source_term(manifest: Manifest, term: str) -> SelectorTerm:
     if source_name not in manifest.sources:
         raise ValueError(f"unknown source selector: {source_name}")
     return SelectorTerm(
-        assets=set(manifest.asset_order) if include_downstream else {"parsed"},
+        assets=(
+            set(manifest.asset_order)
+            if include_downstream
+            else {
+                asset.name
+                for asset in manifest.assets.values()
+                if asset.source == source_name
+            }
+        ),
         source_names={source_name},
     )
 

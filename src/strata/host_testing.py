@@ -9,7 +9,7 @@ import yaml
 
 from strata.api import apply_project, plan_project
 from strata.core.hashing import hash_file
-from strata.executors.local import ApplyResult
+from strata.executors.protocols import ApplyResult
 
 
 @dataclass(frozen=True)
@@ -93,24 +93,24 @@ class TestHostApp:
             "pipeline": {
                 "parsed": {
                     "source": "docs",
-                    "parser": "liteparse",
+                    "operation": "liteparse",
                     "version": "parsed@0.1.0",
                 },
                 "chunks": {
                     "input": "parsed",
-                    "transform": "fixed_token_chunker",
+                    "operation": "fixed_token_chunker",
                     "version": "fixed_token_chunker@0.1.0",
-                    "config": {"max_chars": 80, "overlap_chars": 10},
+                    "config": {"output_label": "chunk", "max_chars": 80, "overlap_chars": 10},
                 },
                 "embeddings": {
                     "input": "chunks",
-                    "transform": "fake_embedding",
+                    "operation": "fake_embedding",
                     "version": "fake_embedding@0.1.0",
                     "config": {"dimensions": 8},
                 },
                 "sink": {
                     "inputs": {"chunk": "chunks", "embedding": "embeddings"},
-                    "type": "local_sqlite_vector_sink",
+                    "operation": "local_sqlite_vector_sink",
                     "version": "local_sqlite_vector_sink@0.1.0",
                 },
             },

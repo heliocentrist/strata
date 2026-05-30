@@ -5,7 +5,7 @@ from pathlib import Path
 
 from strata.core.config import load_manifest, state_path_from_url
 from strata.core.planning import plan
-from strata.executors.local import apply_operations
+from strata.execution.apply import apply_operations
 from strata.sources.registry import snapshot_sources
 from strata.state.connection import bootstrap, connect_state
 from strata.state.repository import StateRepository
@@ -49,18 +49,19 @@ sources:
 pipeline:
   parsed:
     source: docs
-    parser: liteparse
+    operation: liteparse
     version: parsed@0.1.0
   chunks:
     input: parsed
-    transform: fixed_token_chunker
+    operation: fixed_token_chunker
     version: fixed_token_chunker@0.1.0
     config:
+      output_label: chunk
       max_chars: 80
       overlap_chars: 10
   embeddings:
     input: chunks
-    transform: fake_embedding
+    operation: fake_embedding
     version: fake_embedding@0.1.0
     config:
       dimensions: 8
@@ -68,7 +69,7 @@ pipeline:
     inputs:
       chunk: chunks
       embedding: embeddings
-    type: local_sqlite_vector_sink
+    operation: local_sqlite_vector_sink
     version: local_sqlite_vector_sink@0.1.0
 """,
         encoding="utf-8",

@@ -12,7 +12,8 @@ from strata.cli.render import print_doctor, print_inspect, print_operations, pri
 from strata.core.config import load_manifest, state_path_from_url
 from strata.core.models import Manifest
 from strata.core.planning import plan
-from strata.executors.registry import get_executor
+from strata.execution.apply import apply_operations
+from strata.executors.registry import get_operation_runner
 from strata.plugins.discovery import discover_external_plugins
 from strata.sources.registry import snapshot_sources
 from strata.state.connection import bootstrap, connect_state
@@ -94,13 +95,13 @@ def apply_command(
     if not operations:
         console.print("[green]Nothing to apply.[/green]")
         return
-    executor = get_executor(manifest.execution.executor)
-    result = executor.apply(
+    runner = get_operation_runner(manifest.execution.executor, manifest.execution.config)
+    result = apply_operations(
         manifest=manifest,
         repo=repo,
         source_snapshots=snapshots,
         operations=operations,
-        config=manifest.execution.config,
+        runner=runner,
     )
     console.print(
         "[bold]Apply complete[/bold] "

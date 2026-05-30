@@ -31,27 +31,30 @@ sources:
 pipeline:
   parsed:
     source: docs
-    parser: markdown_noop
+    operation: markdown_noop
     version: markdown_noop@0.1.0
 
   chunks:
     input: parsed
-    transform: fixed_token_chunker
+    operation: fixed_token_chunker
     version: fixed_token_chunker@0.1.0
     config:
+      output_label: chunk
       max_chars: {max_chars}
       overlap_chars: 5
 
   embeddings:
     input: chunks
-    transform: fake_embedding
+    operation: fake_embedding
     version: fake_embedding@0.1.0
     config:
       dimensions: 8
 
   sink:
-    input: embeddings
-    type: local_sqlite_vector_sink
+    inputs:
+      chunk: chunks
+      embedding: embeddings
+    operation: local_sqlite_vector_sink
     version: sink@0.1.0
 
 tests:

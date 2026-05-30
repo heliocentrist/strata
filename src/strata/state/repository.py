@@ -390,38 +390,6 @@ class StateRepository:
             metadata=json.loads(row["metadata_json"] or "{}"),
         )
 
-    def latest_materialized_by_prefix(
-        self, asset_name: str, instance_key_prefix: str
-    ) -> list[MaterializedArtifact]:
-        with self.engine.connect() as conn:
-            rows = conn.execute(
-                select(asset_instances)
-                .where(
-                    asset_instances.c.project_id == self.context.project_id,
-                    asset_instances.c.tenant_id == self.context.tenant_id,
-                    asset_instances.c.asset_name == asset_name,
-                    asset_instances.c.instance_key.like(f"{instance_key_prefix}%"),
-                    asset_instances.c.status == "materialized",
-                )
-                .order_by(asset_instances.c.instance_key, asset_instances.c.updated_at.desc())
-            ).mappings().all()
-        latest: dict[str, Any] = {}
-        for row in rows:
-            latest.setdefault(row["instance_key"], row)
-        return [
-            MaterializedArtifact(
-                id=row["id"],
-                asset_name=row["asset_name"],
-                instance_key=row["instance_key"],
-                input_fingerprint=row["input_fingerprint"],
-                output_location=row["output_location"],
-                output_hash=row["output_hash"],
-                content_hash=row["content_hash"],
-                metadata=json.loads(row["metadata_json"] or "{}"),
-            )
-            for row in latest.values()
-        ]
-
     def write_asset_instance(
         self,
         *,
@@ -615,6 +583,61 @@ class StateRepository:
                 metadata=json.loads(row["metadata_json"] or "{}"),
             )
             for row in rows
+        ]
+
+    def materialized_descendants(
+        self,
+        root_id: str,
+        *,
+        asset_name: str | None = None,
+    ) -> list[MaterializedArtifact]:
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                select(asset_instances).where(
+                    asset_instances.c.project_id == self.context.project_id,
+                    asset_instances.c.tenant_id == self.context.tenant_id,
+                    asset_instances.c.status == "materialized",
+                )
+            ).mappings().all()
+            edges = conn.execute(select(lineage_edges)).mappings().all()
+
+        scoped_ids = {str(row["id"]) for row in rows}
+        by_id = {str(row["id"]): row for row in rows}
+        downstream_by_upstream: dict[str, list[str]] = {}
+        for edge in edges:
+            upstream_id = str(edge["upstream_asset_instance_id"])
+            downstream_id = str(edge["downstream_asset_instance_id"])
+            if upstream_id in scoped_ids and downstream_id in scoped_ids:
+                downstream_by_upstream.setdefault(upstream_id, []).append(downstream_id)
+
+        descendants: list[Any] = []
+        seen = {root_id}
+        queue = list(downstream_by_upstream.get(root_id, []))
+        while queue:
+            instance_id = queue.pop(0)
+            if instance_id in seen:
+                continue
+            seen.add(instance_id)
+            row = by_id.get(instance_id)
+            if row is None:
+                continue
+            if asset_name is None or row["asset_name"] == asset_name:
+                descendants.append(row)
+            queue.extend(downstream_by_upstream.get(instance_id, []))
+
+        descendants.sort(key=lambda row: (row["asset_name"], row["instance_key"]))
+        return [
+            MaterializedArtifact(
+                id=row["id"],
+                asset_name=row["asset_name"],
+                instance_key=row["instance_key"],
+                input_fingerprint=row["input_fingerprint"],
+                output_location=row["output_location"],
+                output_hash=row["output_hash"],
+                content_hash=row["content_hash"],
+                metadata=json.loads(row["metadata_json"] or "{}"),
+            )
+            for row in descendants
         ]
 
     def _write_lineage(self, conn: Connection, upstream_id: str, downstream_id: str) -> None:

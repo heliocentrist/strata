@@ -5,14 +5,11 @@ from importlib.metadata import entry_points
 from typing import Any
 
 from strata.plugins.protocols import AdapterMetadata, ExternalPluginDiscoveryResult
-from strata.plugins.registry import Registry, chunkers, embedders, parsers, sinks, sources
+from strata.plugins.registry import Registry, operations, sources
 
 ENTRY_POINT_GROUPS: dict[str, tuple[str, Registry[Any], tuple[str, ...]]] = {
     "strata.sources": ("source", sources, ("source",)),
-    "strata.parsers": ("parser", parsers, ("parsed",)),
-    "strata.chunkers": ("chunker", chunkers, ("chunks",)),
-    "strata.embedders": ("embedding", embedders, ("embeddings",)),
-    "strata.sinks": ("sink", sinks, ("sink",)),
+    "strata.operations": ("operation", operations, ()),
 }
 
 _external_plugins_discovered = False

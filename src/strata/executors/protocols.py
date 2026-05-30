@@ -1,21 +1,27 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Protocol
 
-from strata.core.models import Manifest, Operation, SourceSnapshot
+from strata.core.operations import OperationInput, OperationOutput
 
 
 class ApplyResult(dict[str, Any]):
     pass
 
 
-class ExecutorAdapter(Protocol):
-    def apply(
+@dataclass(frozen=True)
+class OperationInvocation:
+    invocation_id: str
+    operation_name: str
+    inputs: list[OperationInput]
+    config: dict[str, Any]
+
+
+class OperationRunner(Protocol):
+    async def run(self, invocation: OperationInvocation) -> list[OperationOutput]: ...
+
+    async def run_many(
         self,
-        *,
-        manifest: Manifest,
-        repo: Any,
-        source_snapshots: dict[str, SourceSnapshot],
-        operations: list[Operation],
-        config: dict[str, Any] | None = None,
-    ) -> ApplyResult: ...
+        invocations: list[OperationInvocation],
+    ) -> list[list[OperationOutput]]: ...

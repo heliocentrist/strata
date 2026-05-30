@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from strata.core.hashing import config_hash, input_fingerprint
 

@@ -1,7 +1,7 @@
 ﻿from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 from urllib.parse import urlparse
 
 import yaml
@@ -15,15 +15,7 @@ from strata.core.models import (
     SourceSpec,
     TestSpec,
 )
-
-AssetKind = Literal["parsed", "chunks", "embeddings", "sink"]
-
-PIPELINE_KINDS: dict[str, AssetKind] = {
-    "parsed": "parsed",
-    "chunks": "chunks",
-    "embeddings": "embeddings",
-    "sink": "sink",
-}
+from strata.plugins.registry import adapter_metadata
 
 
 def load_manifest(project_file: Path) -> Manifest:
@@ -51,25 +43,25 @@ def load_manifest(project_file: Path) -> Manifest:
         raise ValueError("strata.yml must define at least one source")
 
     raw_pipeline = raw.get("pipeline", {})
-    asset_order = [
-        name for name in ["parsed", "chunks", "embeddings", "sink"] if name in raw_pipeline
-    ]
-    if asset_order != list(raw_pipeline.keys()):
-        unknown = [name for name in raw_pipeline if name not in PIPELINE_KINDS]
-        if unknown:
-            raise ValueError(f"unsupported Phase 0 asset(s): {', '.join(unknown)}")
+    if not isinstance(raw_pipeline, dict) or not raw_pipeline:
+        raise ValueError("strata.yml must define at least one pipeline asset")
+    asset_order = _topological_asset_order(raw_pipeline)
 
     assets: dict[str, AssetSpec] = {}
     for name in asset_order:
         spec = dict(raw_pipeline[name] or {})
         version = spec.pop("version", None) or f"{name}@0.1.0"
-        kind = PIPELINE_KINDS[name]
-        assets[name] = AssetSpec(name=name, kind=kind, version=version, **spec)
-
-    required = ["parsed", "chunks", "embeddings", "sink"]
-    missing = [name for name in required if name not in assets]
-    if missing:
-        raise ValueError(f"Phase 0 pipeline requires assets: {', '.join(required)}")
+        operation_name = _operation_ref(name, spec)
+        adapter_metadata("operation", operation_name)
+        kind = str(spec.pop("kind", None) or _default_asset_kind(name, spec))
+        assets[name] = AssetSpec(
+            name=name,
+            kind=kind,
+            operation_name=operation_name,
+            version=version,
+            **spec,
+        )
+    _normalize_single_input_sink(assets)
     _validate_pipeline(assets, sources)
 
     state_url = raw.get("state", {}).get("url", "sqlite:///./.strata/state.db")
@@ -99,19 +91,75 @@ def load_manifest(project_file: Path) -> Manifest:
 
 
 def _validate_pipeline(assets: dict[str, AssetSpec], sources: dict[str, SourceSpec]) -> None:
-    parsed = assets["parsed"]
-    if not parsed.source or parsed.source not in sources:
-        raise ValueError("parsed asset must reference an existing source")
-    if assets["chunks"].input != "parsed":
-        raise ValueError("chunks.input must be 'parsed'")
-    if assets["embeddings"].input != "chunks":
-        raise ValueError("embeddings.input must be 'chunks'")
-    sink = assets["sink"]
-    if sink.inputs:
-        if sink.inputs.get("chunk") != "chunks" or sink.inputs.get("embedding") != "embeddings":
-            raise ValueError("sink.inputs must map chunk: chunks and embedding: embeddings")
-    elif sink.input != "embeddings":
-        raise ValueError("sink.input must be 'embeddings'")
+    source_assets = [asset for asset in assets.values() if asset.source]
+    if not source_assets:
+        raise ValueError("pipeline must define at least one source-backed asset")
+    for asset in assets.values():
+        if asset.source and asset.source not in sources:
+            raise ValueError(f"asset {asset.name} references unknown source: {asset.source}")
+        if asset.input and asset.input not in assets:
+            raise ValueError(f"asset {asset.name} references unknown input asset: {asset.input}")
+        for role, input_asset in asset.inputs.items():
+            if input_asset not in assets:
+                raise ValueError(
+                    f"asset {asset.name} input role {role} references unknown asset: {input_asset}"
+                )
+        binding_count = sum(bool(value) for value in (asset.source, asset.input, asset.inputs))
+        if binding_count != 1:
+            raise ValueError(
+                f"asset {asset.name} must define exactly one of source, input, or inputs"
+            )
+
+
+def _normalize_single_input_sink(assets: dict[str, AssetSpec]) -> None:
+    for asset in assets.values():
+        if asset.inputs or not asset.input or asset.kind != "sink":
+            continue
+        primary_asset = assets.get(asset.input)
+        if primary_asset is not None and primary_asset.input:
+            asset.inputs = {"chunk": primary_asset.input, "embedding": asset.input}
+            asset.input = None
+
+
+def _operation_ref(asset_name: str, spec: dict[str, Any]) -> str:
+    if spec.get("operation"):
+        return str(spec.pop("operation"))
+    raise ValueError(f"asset {asset_name} must define operation")
+
+
+def _default_asset_kind(asset_name: str, spec: dict[str, Any]) -> str:
+    if spec.get("source"):
+        return "parsed"
+    if spec.get("inputs"):
+        return "sink"
+    return asset_name
+
+
+def _topological_asset_order(raw_pipeline: dict[str, Any]) -> list[str]:
+    ordered: list[str] = []
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(name: str) -> None:
+        if name in visited:
+            return
+        if name in visiting:
+            raise ValueError(f"pipeline contains a dependency cycle at asset: {name}")
+        if name not in raw_pipeline:
+            raise ValueError(f"pipeline references unknown asset: {name}")
+        visiting.add(name)
+        spec = dict(raw_pipeline[name] or {})
+        if spec.get("input"):
+            visit(str(spec["input"]))
+        for input_asset in dict(spec.get("inputs") or {}).values():
+            visit(str(input_asset))
+        visiting.remove(name)
+        visited.add(name)
+        ordered.append(name)
+
+    for asset_name in raw_pipeline:
+        visit(str(asset_name))
+    return ordered
 
 
 def _resolve_project_uri(value: str, root: Path) -> str:

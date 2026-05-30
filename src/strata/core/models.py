@@ -40,16 +40,15 @@ class SourceSpec(BaseModel):
 
 class AssetSpec(BaseModel):
     name: str
-    kind: Literal["parsed", "chunks", "embeddings", "sink"]
+    kind: str
+    operation_name: str
     source: str | None = None
     input: str | None = None
     inputs: dict[str, str] = Field(default_factory=dict)
     join: dict[str, Any] = Field(default_factory=dict)
-    parser: str | None = None
-    transform: str | None = None
-    type: str | None = None
     version: str
     config: dict[str, Any] = Field(default_factory=dict)
+    execution: dict[str, Any] = Field(default_factory=dict)
     artifact_strategy: dict[str, Any] = Field(default_factory=dict)
     determinism: Determinism = Determinism.DETERMINISTIC
     materialization_strategy: str = "content_addressed"

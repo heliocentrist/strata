@@ -5,10 +5,7 @@ from typing import Generic, TypeVar
 from strata.plugins.protocols import (
     AdapterMetadata,
     ArtifactCollection,
-    ChunkerAdapter,
-    EmbeddingAdapter,
-    ParserAdapter,
-    SinkAdapter,
+    OperationPlugin,
     SourceAdapter,
 )
 
@@ -44,32 +41,29 @@ class Registry(Generic[AdapterT]):
             known = ", ".join(sorted(self._items)) or "(none)"
             raise ValueError(f"unknown {self.kind} adapter '{name}'. Known: {known}") from exc
 
+    def get_metadata(self, name: str) -> AdapterMetadata:
+        try:
+            return self._metadata[name]
+        except KeyError as exc:
+            known = ", ".join(sorted(self._metadata)) or "(none)"
+            raise ValueError(f"unknown {self.kind} adapter '{name}'. Known: {known}") from exc
+
     def metadata(self) -> list[AdapterMetadata]:
         return [self._metadata[name] for name in sorted(self._metadata)]
 
 
-parsers: Registry[ParserAdapter] = Registry("parser")
-chunkers: Registry[ChunkerAdapter] = Registry("chunker")
-embedders: Registry[EmbeddingAdapter] = Registry("embedding")
-sinks: Registry[SinkAdapter] = Registry("sink")
+operations: Registry[OperationPlugin] = Registry("operation")
 sources: Registry[SourceAdapter] = Registry("source")
 artifact_collections: Registry[ArtifactCollection] = Registry("artifact_collection")
 
 
-def register_parser(name: str, adapter: ParserAdapter) -> None:
-    parsers.register(name, adapter)
-
-
-def register_chunker(name: str, adapter: ChunkerAdapter) -> None:
-    chunkers.register(name, adapter)
-
-
-def register_embedder(name: str, adapter: EmbeddingAdapter) -> None:
-    embedders.register(name, adapter)
-
-
-def register_sink(name: str, adapter: SinkAdapter) -> None:
-    sinks.register(name, adapter)
+def register_operation(
+    name: str,
+    adapter: OperationPlugin,
+    *,
+    metadata: AdapterMetadata | None = None,
+) -> None:
+    operations.register(name, adapter, metadata=metadata or _metadata(name, "operation"))
 
 
 def register_source(name: str, adapter: SourceAdapter) -> None:
@@ -80,20 +74,16 @@ def register_artifact_collection(name: str, adapter: ArtifactCollection) -> None
     artifact_collections.register(name, adapter)
 
 
-def get_parser(name: str) -> ParserAdapter:
-    return parsers.get(name)
+def _metadata(name: str, kind: str) -> AdapterMetadata:
+    return AdapterMetadata(
+        name=name,
+        kind=kind,
+        source="in-process",
+    )
 
 
-def get_chunker(name: str) -> ChunkerAdapter:
-    return chunkers.get(name)
-
-
-def get_embedder(name: str) -> EmbeddingAdapter:
-    return embedders.get(name)
-
-
-def get_sink(name: str) -> SinkAdapter:
-    return sinks.get(name)
+def get_operation(name: str) -> OperationPlugin:
+    return operations.get(name)
 
 
 def get_source(name: str) -> SourceAdapter:
@@ -104,12 +94,19 @@ def get_artifact_collection(name: str) -> ArtifactCollection:
     return artifact_collections.get(name)
 
 
+def adapter_metadata(kind: str, name: str) -> AdapterMetadata:
+    if kind == "operation":
+        return operations.get_metadata(name)
+    if kind == "source":
+        return sources.get_metadata(name)
+    if kind == "artifact_collection":
+        return artifact_collections.get_metadata(name)
+    raise ValueError(f"unknown adapter kind: {kind}")
+
+
 def registered_plugins() -> list[AdapterMetadata]:
     return [
-        *parsers.metadata(),
-        *chunkers.metadata(),
-        *embedders.metadata(),
-        *sinks.metadata(),
+        *operations.metadata(),
         *sources.metadata(),
         *artifact_collections.metadata(),
     ]

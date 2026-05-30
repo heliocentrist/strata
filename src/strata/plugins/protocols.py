@@ -5,10 +5,10 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from strata.core.collections import ArtifactCollection
-from strata.core.models import HybridChunkEmbeddingItem, SinkWriteResult, SourceSnapshot, SourceSpec
+from strata.core.models import SourceSnapshot, SourceSpec
+from strata.core.operations import OperationInput, OperationOutput
 
 STRATA_PLUGIN_API_VERSION = "0.1"
-
 
 @dataclass(frozen=True)
 class AdapterMetadata:
@@ -27,36 +27,12 @@ class ExternalPluginDiscoveryResult:
     errors: list[str] = field(default_factory=list)
 
 
-class ParserAdapter(Protocol):
-    def parse(self, path: Path) -> str: ...
-
-
-class ChunkerAdapter(Protocol):
-    def chunk(self, text: str, config: dict[str, Any]) -> list[str]: ...
-
-
-class EmbeddingAdapter(Protocol):
-    def embed(self, text: str, config: dict[str, Any]) -> list[float]: ...
-
-
-class SinkAdapter(Protocol):
-    def write_hybrid(
+class OperationPlugin(Protocol):
+    def run(
         self,
-        *,
-        item: HybridChunkEmbeddingItem,
+        inputs: list[OperationInput],
         config: dict[str, Any],
-    ) -> SinkWriteResult: ...
-
-    def write(
-        self,
-        *,
-        repo: Any,
-        instance_key: str,
-        embedding_fingerprint: str,
-        source_item_key: str,
-        chunk_text: str,
-        embedding: list[float],
-    ) -> None: ...
+    ) -> list[OperationOutput]: ...
 
 
 class SourceAdapter(Protocol):
@@ -67,10 +43,9 @@ __all__ = [
     "STRATA_PLUGIN_API_VERSION",
     "AdapterMetadata",
     "ArtifactCollection",
-    "ChunkerAdapter",
-    "EmbeddingAdapter",
     "ExternalPluginDiscoveryResult",
-    "ParserAdapter",
-    "SinkAdapter",
+    "OperationInput",
+    "OperationOutput",
+    "OperationPlugin",
     "SourceAdapter",
 ]

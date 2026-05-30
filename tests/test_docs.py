@@ -7,7 +7,7 @@ from conftest import write_project
 
 from strata.core.config import load_manifest, state_path_from_url
 from strata.core.planning import plan
-from strata.executors.local import apply_operations
+from strata.execution.apply import apply_operations
 from strata.sources.registry import snapshot_sources
 from strata.state.connection import bootstrap, connect_state
 from strata.state.repository import StateRepository

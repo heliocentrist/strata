@@ -1,28 +1,41 @@
 from __future__ import annotations
 
-from strata.executors.protocols import ExecutorAdapter
+from collections.abc import Callable
+from typing import Any
 
-_executors: dict[str, ExecutorAdapter] = {}
+from strata.executors.protocols import OperationRunner
+
+OperationRunnerFactory = Callable[[dict[str, Any] | None], OperationRunner]
+
+_operation_runners: dict[str, OperationRunnerFactory] = {}
 
 
-def register_executor(name: str, executor: ExecutorAdapter) -> None:
+def register_operation_runner(name: str, factory: OperationRunnerFactory) -> None:
     if not name:
-        raise ValueError("executor name cannot be empty")
-    _executors[name] = executor
+        raise ValueError("operation runner name cannot be empty")
+    _operation_runners[name] = factory
 
 
-def get_executor(name: str) -> ExecutorAdapter:
+def get_operation_runner(
+    name: str,
+    config: dict[str, Any] | None = None,
+) -> OperationRunner:
     try:
-        return _executors[name]
+        factory = _operation_runners[name]
     except KeyError as exc:
-        known = ", ".join(sorted(_executors)) or "(none)"
-        raise ValueError(f"unknown executor '{name}'. Known: {known}") from exc
+        known = ", ".join(sorted(_operation_runners)) or "(none)"
+        raise ValueError(f"unknown operation runner '{name}'. Known: {known}") from exc
+    return factory(config)
+
+
+def registered_operation_runners() -> list[str]:
+    return sorted(_operation_runners)
 
 
 def registered_executors() -> list[str]:
-    return sorted(_executors)
+    return registered_operation_runners()
 
 
-from strata.executors.local import register_builtin_executors  # noqa: E402
+from strata.executors.local import register_builtin_operation_runners  # noqa: E402
 
-register_builtin_executors()
+register_builtin_operation_runners()
