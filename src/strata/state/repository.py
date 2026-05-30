@@ -9,6 +9,7 @@ from typing import Any
 
 from sqlalchemy import delete, insert, or_, select, update
 from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.exc import IntegrityError
 
 from strata.core.models import (
     AssetInstanceCommit,
@@ -278,31 +279,61 @@ class StateRepository:
         config_hash_value: str,
         determinism: str,
     ) -> str:
-        with self.begin() as conn:
-            row = conn.execute(
-                select(transforms.c.id).where(
-                    transforms.c.project_id == project_id,
-                    transforms.c.transform_id == transform_id,
-                    transforms.c.version == version,
-                    transforms.c.config_hash == config_hash_value,
-                )
-            ).first()
-            if row:
-                return str(row[0])
-            transform_pk = new_id()
-            conn.execute(
-                insert(transforms).values(
-                    id=transform_pk,
+        try:
+            with self.begin() as conn:
+                row = self._find_transform(
+                    conn,
                     project_id=project_id,
                     transform_id=transform_id,
                     version=version,
-                    config_json=config_json,
-                    config_hash=config_hash_value,
-                    determinism=determinism,
-                    created_at=now(),
+                    config_hash_value=config_hash_value,
                 )
+                if row:
+                    return str(row[0])
+                transform_pk = new_id()
+                conn.execute(
+                    insert(transforms).values(
+                        id=transform_pk,
+                        project_id=project_id,
+                        transform_id=transform_id,
+                        version=version,
+                        config_json=config_json,
+                        config_hash=config_hash_value,
+                        determinism=determinism,
+                        created_at=now(),
+                    )
+                )
+                return transform_pk
+        except IntegrityError:
+            with self.engine.connect() as conn:
+                row = self._find_transform(
+                    conn,
+                    project_id=project_id,
+                    transform_id=transform_id,
+                    version=version,
+                    config_hash_value=config_hash_value,
+                )
+                if row:
+                    return str(row[0])
+            raise
+
+    def _find_transform(
+        self,
+        conn: Connection,
+        *,
+        project_id: str,
+        transform_id: str,
+        version: str,
+        config_hash_value: str,
+    ) -> Any:
+        return conn.execute(
+            select(transforms.c.id).where(
+                transforms.c.project_id == project_id,
+                transforms.c.transform_id == transform_id,
+                transforms.c.version == version,
+                transforms.c.config_hash == config_hash_value,
             )
-            return transform_pk
+        ).first()
 
     def find_materialized(
         self, asset_name: str, instance_key: str, input_fingerprint_value: str

@@ -18,6 +18,11 @@ class ExecutionContext(BaseModel):
     tenant_id: str = "default"
 
 
+class ExecutionSpec(BaseModel):
+    executor: str = "local_single_thread"
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
 class SourceSnapshotMode(StrEnum):
     AUTHORITATIVE = "authoritative_snapshot"
     INCREMENTAL = "incremental_delta"
@@ -59,6 +64,7 @@ class TestSpec(BaseModel):
 
 class Manifest(BaseModel):
     context: ExecutionContext
+    execution: ExecutionSpec = Field(default_factory=ExecutionSpec)
     root: Path
     state_url: str
     artifacts_path: Path

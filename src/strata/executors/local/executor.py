@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -25,12 +26,41 @@ from strata.execution.artifacts import (
     write_many_artifacts,
     write_one_artifact,
 )
+from strata.executors.protocols import ApplyResult
 from strata.plugins.registry import get_chunker, get_embedder, get_parser, get_sink
 from strata.state.repository import StateRepository
 
+ASSET_EXECUTION_ORDER = ("parsed", "chunks", "embeddings", "sink")
 
-class ApplyResult(dict[str, Any]):
-    pass
+
+@dataclass(frozen=True)
+class LocalExecutor:
+    max_workers: int = 1
+
+    def apply(
+        self,
+        *,
+        manifest: Manifest,
+        repo: StateRepository,
+        source_snapshots: dict[str, SourceSnapshot],
+        operations: list[Operation],
+        config: dict[str, Any] | None = None,
+    ) -> ApplyResult:
+        configured_workers = int((config or {}).get("max_workers") or self.max_workers)
+        return apply_operations(
+            manifest=manifest,
+            repo=repo,
+            source_snapshots=source_snapshots,
+            operations=operations,
+            max_workers=configured_workers,
+        )
+
+
+def register_builtin_executors() -> None:
+    from strata.executors.registry import register_executor
+
+    register_executor("local_single_thread", LocalExecutor(max_workers=1))
+    register_executor("local_threaded", LocalExecutor(max_workers=4))
 
 
 @dataclass(frozen=True)
@@ -50,6 +80,7 @@ def apply_operations(
     repo: StateRepository,
     source_snapshots: dict[str, SourceSnapshot],
     operations: list[Operation],
+    max_workers: int = 1,
 ) -> ApplyResult:
     run_id = repo.create_run(manifest.manifest_hash)
     repo.acquire_lock(run_id)
@@ -60,36 +91,37 @@ def apply_operations(
             operation.op_id: repo.create_operation_run(run_id, operation)
             for operation in operations
         }
-        for operation in operations:
-            operation_run_id = operation_run_ids[operation.op_id]
-            repo.update_operation_run(operation_run_id, "running")
-            try:
-                if operation.op_type == "delete_scope":
-                    deleted = _execute_delete(repo, run_id, operation_run_id, operation)
-                    counts["deleted"] += deleted
-                elif operation.asset_name == "parsed":
-                    _execute_parsed(
-                        manifest,
-                        repo,
-                        source_snapshots,
-                        run_id,
-                        operation_run_id,
-                        operation,
-                        counts,
+        for batch in _operation_batches(operations):
+            if max_workers <= 1 or len(batch) == 1:
+                for operation in batch:
+                    operation_counts, operation_failed = _run_operation(
+                        manifest=manifest,
+                        repo=repo,
+                        source_snapshots=source_snapshots,
+                        run_id=run_id,
+                        operation_run_id=operation_run_ids[operation.op_id],
+                        operation=operation,
                     )
-                elif operation.asset_name == "chunks":
-                    _execute_chunks(manifest, repo, run_id, operation_run_id, operation, counts)
-                elif operation.asset_name == "embeddings":
-                    _execute_embeddings(manifest, repo, run_id, operation_run_id, operation, counts)
-                elif operation.asset_name == "sink":
-                    _execute_sink(manifest, repo, run_id, operation_run_id, operation, counts)
-                else:
-                    raise ValueError(f"unsupported asset: {operation.asset_name}")
-                repo.update_operation_run(operation_run_id, "succeeded")
-            except Exception as exc:  # keep other operations inspectable
-                failed = True
-                counts["failed"] += 1
-                repo.update_operation_run(operation_run_id, "failed", str(exc))
+                    _merge_counts(counts, operation_counts)
+                    failed = failed or operation_failed
+            else:
+                with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                    futures = [
+                        pool.submit(
+                            _run_operation,
+                            manifest=manifest,
+                            repo=repo,
+                            source_snapshots=source_snapshots,
+                            run_id=run_id,
+                            operation_run_id=operation_run_ids[operation.op_id],
+                            operation=operation,
+                        )
+                        for operation in batch
+                    ]
+                    for future in as_completed(futures):
+                        operation_counts, operation_failed = future.result()
+                        _merge_counts(counts, operation_counts)
+                        failed = failed or operation_failed
         for snapshot in source_snapshots.values():
             repo.update_source_checkpoint(
                 snapshot.source_name,
@@ -101,6 +133,73 @@ def apply_operations(
     finally:
         repo.release_lock()
     return ApplyResult(run_id=run_id, **counts)
+
+
+def _run_operation(
+    *,
+    manifest: Manifest,
+    repo: StateRepository,
+    source_snapshots: dict[str, SourceSnapshot],
+    run_id: str,
+    operation_run_id: str,
+    operation: Operation,
+) -> tuple[dict[str, int], bool]:
+    counts: dict[str, int] = {"built": 0, "reused": 0, "deleted": 0, "failed": 0}
+    repo.update_operation_run(operation_run_id, "running")
+    try:
+        if operation.op_type == "delete_scope":
+            counts["deleted"] += _execute_delete(repo, run_id, operation_run_id, operation)
+        elif operation.asset_name == "parsed":
+            _execute_parsed(
+                manifest,
+                repo,
+                source_snapshots,
+                run_id,
+                operation_run_id,
+                operation,
+                counts,
+            )
+        elif operation.asset_name == "chunks":
+            _execute_chunks(manifest, repo, run_id, operation_run_id, operation, counts)
+        elif operation.asset_name == "embeddings":
+            _execute_embeddings(manifest, repo, run_id, operation_run_id, operation, counts)
+        elif operation.asset_name == "sink":
+            _execute_sink(manifest, repo, run_id, operation_run_id, operation, counts)
+        else:
+            raise ValueError(f"unsupported asset: {operation.asset_name}")
+        repo.update_operation_run(operation_run_id, "succeeded")
+        return counts, False
+    except Exception as exc:  # keep other operations inspectable
+        counts["failed"] += 1
+        repo.update_operation_run(operation_run_id, "failed", str(exc))
+        return counts, True
+
+
+def _operation_batches(operations: list[Operation]) -> list[list[Operation]]:
+    deletes = [operation for operation in operations if operation.op_type == "delete_scope"]
+    batches: list[list[Operation]] = []
+    if deletes:
+        batches.append(deletes)
+    for asset_name in ASSET_EXECUTION_ORDER:
+        batch = [
+            operation
+            for operation in operations
+            if operation.op_type == "build_scope" and operation.asset_name == asset_name
+        ]
+        if batch:
+            batches.append(batch)
+    known = {operation.op_id for operation in deletes}
+    for batch in batches:
+        known.update(operation.op_id for operation in batch)
+    leftovers = [operation for operation in operations if operation.op_id not in known]
+    if leftovers:
+        batches.append(leftovers)
+    return batches
+
+
+def _merge_counts(target: dict[str, int], source: dict[str, int]) -> None:
+    for key, value in source.items():
+        target[key] = target.get(key, 0) + value
 
 
 def _source_item(

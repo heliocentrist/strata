@@ -1,3 +1,8 @@
-﻿from strata.executors.local.executor import ApplyResult, apply_operations
+from strata.executors.local.executor import (
+    LocalExecutor,
+    apply_operations,
+    register_builtin_executors,
+)
+from strata.executors.protocols import ApplyResult
 
-__all__ = ["ApplyResult", "apply_operations"]
+__all__ = ["ApplyResult", "LocalExecutor", "apply_operations", "register_builtin_executors"]

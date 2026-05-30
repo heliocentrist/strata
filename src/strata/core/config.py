@@ -7,7 +7,14 @@ from urllib.parse import urlparse
 import yaml
 
 from strata.core.hashing import hash_canonical
-from strata.core.models import AssetSpec, ExecutionContext, Manifest, SourceSpec, TestSpec
+from strata.core.models import (
+    AssetSpec,
+    ExecutionContext,
+    ExecutionSpec,
+    Manifest,
+    SourceSpec,
+    TestSpec,
+)
 
 AssetKind = Literal["parsed", "chunks", "embeddings", "sink"]
 
@@ -28,6 +35,7 @@ def load_manifest(project_file: Path) -> Manifest:
         project_id=str(raw.get("project_id", "default")),
         tenant_id=str(raw.get("tenant_id", "default")),
     )
+    execution = ExecutionSpec(**dict(raw.get("execution") or {}))
 
     sources = {}
     for name, spec in raw.get("sources", {}).items():
@@ -71,12 +79,14 @@ def load_manifest(project_file: Path) -> Manifest:
     manifest_payload: dict[str, Any] = {
         "project_id": context.project_id,
         "tenant_id": context.tenant_id,
+        "execution": execution.model_dump(mode="json"),
         "sources": {name: spec.model_dump(mode="json") for name, spec in sources.items()},
         "assets": {name: spec.model_dump(mode="json") for name, spec in assets.items()},
         "tests": [spec.model_dump(mode="json") for spec in tests],
     }
     return Manifest(
         context=context,
+        execution=execution,
         root=root,
         state_url=state_url,
         artifacts_path=artifacts_path,

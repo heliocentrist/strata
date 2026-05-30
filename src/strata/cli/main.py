@@ -12,7 +12,7 @@ from strata.cli.render import print_doctor, print_inspect, print_operations, pri
 from strata.core.config import load_manifest, state_path_from_url
 from strata.core.models import Manifest
 from strata.core.planning import plan
-from strata.executors.local import apply_operations
+from strata.executors.registry import get_executor
 from strata.plugins.discovery import discover_external_plugins
 from strata.sources.registry import snapshot_sources
 from strata.state.connection import bootstrap, connect_state
@@ -63,6 +63,7 @@ def compile_command(
     table.add_row("project_id", manifest.context.project_id)
     table.add_row("tenant_id", manifest.context.tenant_id)
     table.add_row("manifest_hash", manifest.manifest_hash)
+    table.add_row("executor", manifest.execution.executor)
     table.add_row("sources", ", ".join(manifest.sources))
     table.add_row("assets", " -> ".join(manifest.asset_order))
     console.print(table)
@@ -93,14 +94,17 @@ def apply_command(
     if not operations:
         console.print("[green]Nothing to apply.[/green]")
         return
-    result = apply_operations(
+    executor = get_executor(manifest.execution.executor)
+    result = executor.apply(
         manifest=manifest,
         repo=repo,
         source_snapshots=snapshots,
         operations=operations,
+        config=manifest.execution.config,
     )
     console.print(
         "[bold]Apply complete[/bold] "
+        f"executor={manifest.execution.executor} "
         f"run_id={result['run_id']} "
         f"built={result['built']} reused={result['reused']} "
         f"deleted={result['deleted']} failed={result['failed']}"

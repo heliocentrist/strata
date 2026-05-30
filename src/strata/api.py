@@ -8,7 +8,8 @@ from sqlalchemy.engine import Engine
 from strata.core.config import load_manifest, state_path_from_url
 from strata.core.models import Manifest, Operation, SourceSnapshot
 from strata.core.planning import plan
-from strata.executors.local import ApplyResult, apply_operations
+from strata.executors.protocols import ApplyResult
+from strata.executors.registry import get_executor
 from strata.plugins.discovery import discover_external_plugins
 from strata.sources.registry import snapshot_sources
 from strata.state.connection import bootstrap, connect_state
@@ -50,9 +51,11 @@ def apply_project(project: Path | str, selection: str | None = None) -> ApplyRes
     operations = plan(handle.manifest, handle.repo.snapshot(), snapshots, selection)
     if not operations:
         return ApplyResult(run_id=None, built=0, reused=0, deleted=0, failed=0)
-    return apply_operations(
+    executor = get_executor(handle.manifest.execution.executor)
+    return executor.apply(
         manifest=handle.manifest,
         repo=handle.repo,
         source_snapshots=snapshots,
         operations=operations,
+        config=handle.manifest.execution.config,
     )

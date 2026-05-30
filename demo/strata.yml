@@ -7,6 +7,11 @@ state:
 artifacts:
   path: ./.strata/artifacts
 
+execution:
+  executor: local_single_thread
+  config:
+    max_workers: 1
+
 sources:
   docs:
     type: local_files
