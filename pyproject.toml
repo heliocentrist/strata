@@ -22,7 +22,7 @@ dev = [
 ]
 
 [project.scripts]
-strata = "strata.cli:app"
+strata = "strata.cli.main:app"
 
 [build-system]
 requires = ["hatchling"]

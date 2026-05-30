@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 from datetime import timedelta
@@ -7,20 +7,18 @@ from pathlib import Path
 from conftest import write_project
 from sqlalchemy import insert, select
 
-from strata.config import load_manifest, state_path_from_url
-from strata.doctor import run_doctor
-from strata.executor import apply_operations
-from strata.planner import plan
-from strata.source import snapshot_sources
-from strata.state import (
-    StateRepository,
+from strata.core.config import load_manifest, state_path_from_url
+from strata.core.planning import plan
+from strata.executors.local import apply_operations
+from strata.sources.registry import snapshot_sources
+from strata.state.connection import bootstrap, connect_state
+from strata.state.repository import StateRepository, now
+from strata.state.schema import (
     apply_locks,
     asset_instances,
-    bootstrap,
-    connect_state,
-    now,
     vector_sink,
 )
+from strata.tools.doctor import run_doctor
 
 
 def setup_repo(project: Path) -> tuple[object, StateRepository]:
@@ -102,12 +100,12 @@ def test_fanout_instances_have_distinct_fingerprints_and_artifact_identity(
     assert fanout_manifest_path.name.startswith(fanout_manifest["created_at"][:10].replace("-", ""))
     assert fanout_manifest["manifest_hash"][:12] in fanout_manifest_path.name
     assert fanout_manifest["asset_name"] == "chunks"
-    assert fanout_manifest["parent"]["asset_name"] == "parsed"
-    assert fanout_manifest["parent"]["input_fingerprint"] == parent_fingerprint
-    assert fanout_manifest["transform"]["config_hash"]
-    assert fanout_manifest["source"]["name"] == "docs"
-    assert fanout_manifest["source"]["item_key"] == "a.md"
-    assert fanout_manifest["upstreams"][0]["asset_name"] == "parsed"
+    assert fanout_manifest["partition_key"] == parent_fingerprint
+    assert fanout_manifest["collection"]["type"] == "local_json"
+    assert "parent" not in fanout_manifest
+    assert "transform" not in fanout_manifest
+    assert "source" not in fanout_manifest
+    assert "upstreams" not in fanout_manifest
 
     first_item = fanout_manifest["items"][int(item_ref)]
     assert first_item["instance_key"] == rows[0]["instance_key"]

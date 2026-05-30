@@ -2,7 +2,7 @@
 
 *A build system for context: content-addressed, lineage-aware preparation of documents and other raw content for RAG pipelines, agent memory, and knowledge bases.*
 
-**Status:** Phase 0A implemented; Phase 0B reliability hardening implemented; Phase 1A selectors and Phase 1B local plugins implemented
+**Status:** Phase 0A implemented; Phase 0B reliability hardening implemented; Phase 1A selectors and Phase 1B local plugins implemented; Phase 2A tests and external plugin discovery implemented; host-staged ingest foundations partially implemented
 **Author:** —
 **Last updated:** May 2026
 
@@ -369,6 +369,8 @@ strata plan -s chunks+              # scope to chunks and downstream
 strata apply                        # execute the plan
 strata apply -s state:modified+     # rebuild changed nodes and descendants
 strata test -s embeddings           # run asset-level assertions
+strata inspect --asset embeddings --instance-key docs/a.md#chunk:0000
+strata docs build                   # generate searchable static asset browser
 strata docs serve                   # lineage + DAG browser
 strata ls -s source:docs+           # list selected assets
 strata invalidate -s chunks         # force-stale an asset (rare)
@@ -502,6 +504,381 @@ The write order is:
 
 This avoids mutable fanout files. A crash before step 4 leaves orphan payload/manifest files but no reusable state. A crash after step 4 leaves database rows pointing to already-written immutable files. `strata doctor` validates manifest hashes, payload hashes, item content hashes, and missing or orphaned files.
 
+### 6.9 Host-staged object ingest sub-plan
+
+The first production-shaped integration should assume Strata is embedded inside a host ingestion service, not running as the top-level orchestrator. The host owns external credentials, upstream enumeration, download URL freshness, scheduling, cancellation, and user access policy. Strata owns the content-preparation DAG once raw files have been staged durably.
+
+The intended shape is:
+
+```
+host connector/enumerator
+  -> stage raw files into object storage
+  -> write a source object manifest
+  -> call Strata as a library
+  -> inspect/debug with Strata CLI/docs by project id/name
+```
+
+This keeps short-lived source URLs out of Strata and gives Strata a durable, replayable source snapshot.
+
+#### 6.9.1 Source adapters become pluggable
+
+Sources should use the same plugin model as parsers, chunkers, embedders, and sinks:
+
+```python
+class SourceAdapter(Protocol):
+    def snapshot(self, spec: SourceSpec) -> SourceSnapshot:
+        ...
+```
+
+Built-in source adapters:
+
+- `local_files` — current fixture behavior. Strata owns enumeration by scanning a local path.
+- `object_manifest` — host-staged ingest behavior. Strata reads a manifest of already-staged objects.
+
+Later source adapters may include `s3_prefix`, `gcs_prefix`, `http_manifest`, or connector-specific metadata sources, but those should remain plugins rather than core logic.
+
+`SourceSnapshot` needs explicit source semantics:
+
+```python
+class SourceSnapshotMode(StrEnum):
+    AUTHORITATIVE = "authoritative_snapshot"
+    INCREMENTAL = "incremental_delta"
+```
+
+Planner rules:
+
+- `authoritative_snapshot`: absent previously-known source items are treated as deletes.
+- `incremental_delta`: absent items mean unknown/no-op; deletes require explicit `deleted: true` items.
+
+`SourceItem` should support:
+
+```python
+item_key: str                  # stable source identity
+content_hash: str              # source version token, e.g. etag or object version
+uri: str                       # staged object URI
+metadata: dict                 # file name, source path, web URL, MIME type, etc.
+deleted: bool = False
+```
+
+#### 6.9.2 Object manifest source format
+
+The source manifest is an input manifest, separate from Strata artifact/fanout manifests.
+
+Example:
+
+```json
+{
+  "schema_version": 1,
+  "mode": "authoritative_snapshot",
+  "source_name": "staged_documents",
+  "connection_id": "conn_123",
+  "items": [
+    {
+      "item_key": "source:drive:item",
+      "content_hash": "etag-or-object-version",
+      "object_uri": "s3://bucket/raw/source-drive-item.pdf",
+      "metadata": {
+        "file_name": "Report.pdf",
+        "source_path": "/Documents/Reports/Report.pdf",
+        "source_web_url": "https://source.example/Report.pdf",
+        "mime_type": "application/pdf"
+      }
+    }
+  ]
+}
+```
+
+Local development should support filesystem paths and `file://` URIs first. S3/GCS support should come through an object storage abstraction rather than direct path handling in parsers.
+
+#### 6.9.3 Pluggable object storage
+
+Artifacts and staged source objects should be accessed through an object storage interface:
+
+```python
+class ObjectStore(Protocol):
+    def open(self, uri: str) -> BinaryIO:
+        ...
+
+    def read_text(self, uri: str) -> str:
+        ...
+
+    def write_text(self, uri: str, value: str) -> str:
+        ...
+
+    def exists(self, uri: str) -> bool:
+        ...
+```
+
+Built-ins:
+
+- `local` / `file` for local development and tests.
+- `s3` for production object manifests and artifact storage.
+
+The artifact store should continue to be immutable and content-addressed. The object storage abstraction is transport; it must not change fingerprint identity.
+
+#### 6.9.4 Pluggable artifact collections
+
+The core should not know whether an asset is stored as one file per instance, a JSONL bundle, a Parquet shard, or a remote object manifest. It should work with iterable/addressable artifact collections:
+
+```python
+class ArtifactCollection(Protocol):
+    def write_one(self, context: CollectionWriteContext, item: ArtifactWrite) -> ArtifactWriteResult:
+        ...
+
+    def write_many(self, context: CollectionWriteContext, items: list[ArtifactWrite]) -> list[ArtifactWriteResult]:
+        ...
+
+    def read(self, root_path: Path, ref: str) -> dict[str, Any]:
+        ...
+```
+
+The collection owns the physical layout. The state DB stores the returned address/hash. This lets small prototypes use JSON files while production pipelines choose fewer larger files, such as JSONL or Parquet bundles, without changing transform logic.
+
+Initial built-in:
+
+- `local_json` stores single-output artifacts as JSON and fanout artifacts as `payloads/*.jsonl` plus timestamped immutable manifests.
+
+Future built-ins:
+
+- `local_jsonl_bundle` for batching many single-output artifacts into fewer local JSONL files.
+- `s3_jsonl_bundle` for object-storage-backed bundles.
+- `parquet_bundle` for high-volume parsed/chunk/embedding assets.
+
+Manifests are commit markers for bundled writes: payload files are written first; the manifest is written last and is the addressable record used by state.
+
+#### 6.9.5 Multi-input hybrid sink contracts
+
+Hybrid search indexes usually need one physical document per chunk containing both lexical text and vector embedding. Model this as one logical sink asset with named inputs:
+
+```yaml
+search_index:
+  type: elasticsearch_hybrid_sink
+  version: elasticsearch_hybrid_sink@0.1.0
+  inputs:
+    chunk: chunks
+    embedding: embeddings
+  join:
+    type: lineage
+    primary: embedding
+    upstream: chunk
+  config:
+    index: search_chunks
+```
+
+The sink adapter should not crawl Strata internals. Instead:
+
+- The sink declares the input contract it supports.
+- The executor resolves that contract from the DAG and lineage.
+- The executor reads chunk and embedding artifacts and constructs a typed sink item.
+- The sink adapter writes the physical index document and returns an output location/hash.
+- Strata records lineage edges from both chunk and embedding instances to the sink instance.
+
+Conceptual item passed to the sink:
+
+```python
+HybridChunkEmbeddingItem(
+    context=ExecutionContext(...),
+    source=SourceRef(...),
+    chunk=ChunkRef(text=..., fingerprint=..., content_hash=..., metadata=...),
+    embedding=EmbeddingRef(vector=..., fingerprint=..., content_hash=..., metadata=...),
+    document_id="tenant:project:source:drive:item#chunk:0003",
+    metadata={...},
+)
+```
+
+Delete behavior should be part of the sink contract:
+
+```python
+sink.delete_source(context, source_name, source_item_key, config)
+```
+
+For search indexes this may be a delete-by-query or a deletion of tracked document IDs. Host access records remain outside Strata.
+
+#### 6.9.5 Library-first execution API
+
+The host should call Strata as regular code inside its existing execution environment first. Executor adapters are later.
+
+Initial API target:
+
+```python
+result = strata.apply_project(
+    project_id="project_123",
+    tenant_id="tenant_123",
+    state_url="postgresql://...",
+    manifest=manifest,
+    selection=None,
+)
+```
+
+or:
+
+```python
+result = strata.apply_staged_manifest(
+    project_id="project_123",
+    tenant_id="tenant_123",
+    source_manifest_uri="s3://.../manifest.json",
+    pipeline_template="default_rag",
+)
+```
+
+The host scheduler can run this in one activity/job initially. Strata remains responsible for idempotency, cache checks, operation item progress, lineage, and partial item failures. A later Temporal/Dagster executor can map Strata operations to native activities when needed.
+
+#### 6.9.6 Project registry and CLI access to host-created projects
+
+Projects created by a host service may not have a local `strata.yml`. Operators still need to inspect them with the CLI and docs tools.
+
+Add a lightweight project registry/catalog:
+
+```
+strata.projects
+  id
+  project_id
+  tenant_id
+  name
+  state_url
+  artifact_root_uri
+  latest_manifest_json
+  latest_manifest_hash
+  created_at
+  updated_at
+
+  unique(project_id, tenant_id)
+  unique(name)                  -- optional/operator-friendly alias
+```
+
+Required CLI behavior:
+
+```bash
+strata project ls --state-url postgresql://...
+strata project show --state-url postgresql://... --project-id project_123 --tenant-id tenant_123
+strata docs serve --state-url postgresql://... --project-id project_123 --tenant-id tenant_123
+strata inspect --state-url postgresql://... --project-id project_123 --tenant-id tenant_123 --asset chunks --instance-key ...
+```
+
+The existing `-p strata.yml` path remains for local projects. The new state/project-id path is for projects created and processed by a host application.
+
+#### 6.9.7 Milestones for host-staged ingest
+
+**Milestone A — Source/object foundations**
+
+- Add source adapter registry.
+- Move `local_files` behind the registry.
+- Add `object_manifest` source adapter with local/file URI support.
+- Add `SourceSnapshot.mode` and `SourceItem.deleted`.
+- Update planner delete rules for authoritative vs incremental snapshots.
+- Add tests for unchanged, changed, missing-authoritative-delete, missing-incremental-no-op, and explicit incremental delete.
+
+**Current implementation:** source registry, `local_files`, `object_manifest`, snapshot modes, explicit deletes, and authoritative-vs-incremental planner behavior are implemented for local/file URIs.
+
+**Milestone B — Object storage abstraction**
+
+- Add local/file object store.
+- Route artifact reads/writes and object manifest reads through the abstraction where practical.
+- Add S3 object store support.
+- Keep artifact identity independent of storage URI.
+
+**Current implementation:** local/file object store support is implemented for source manifests and staged objects. S3 remains deferred.
+
+**Milestone C — Library execution API**
+
+- Add a stable library entry point for `compile/plan/apply` without Typer.
+- Add a host-staged manifest helper.
+- Return structured per-source-item results: built, reused, deleted, failed, and sink output references.
+- Add tests proving a host can run Strata without a local YAML file.
+
+**Current implementation:** `strata.api` exposes compile/plan/apply helpers, and `strata.host_testing` provides a local host fixture that stages batch inputs and invokes Strata as a library. Per-source-item result summaries and YAML-free host projects remain deferred.
+
+**Milestone D — Hybrid sink contract**
+
+- Add `AssetSpec.inputs` for named inputs.
+- Add sink input contract types.
+- Implement executor-side lineage join for chunk + embedding.
+- Update local sink or add a fake hybrid search sink test double.
+- Record sink lineage from both chunk and embedding.
+
+**Current implementation:** named sink inputs, hybrid chunk+embedding sink item models, executor-side lineage join, local sink hybrid write result, and sink lineage from both chunk and embedding are implemented.
+
+**Milestone E — Search index sink**
+
+- Add an Elasticsearch/OpenSearch hybrid sink adapter.
+- Bulk-write one document per chunk containing text, embedding, source metadata, and fingerprint fields.
+- Implement delete/deactivate by source item.
+- Return stable `output_location` values such as `elasticsearch://index/document_id`.
+
+**Milestone F — Host-created project observability**
+
+- Add project registry/catalog table.
+- Persist latest compiled manifest for host-created projects.
+- Support CLI/docs/inspect/progress by `--state-url + --project-id + --tenant-id` or `--project-name`.
+- Add docs browser support for project registry lookup.
+
+**Milestone G — Executor adapter later**
+
+- Keep the first host integration as one host activity/job calling Strata as a library.
+- Add activity heartbeats/cancellation checks around Strata progress if needed.
+- Only after this is proven, add Temporal/Dagster executors that map Strata operations and operation items onto native activities.
+
+#### 6.9.8 Test host fixture
+
+Before integrating with a real host service, build a small test host app fixture that mimics the intended boundary:
+
+```
+test host
+  -> receives source metadata in batches
+  -> stages raw files into local object storage
+  -> writes an object_manifest source manifest
+  -> calls Strata as an embedded library
+  -> inspects results with Strata state/docs/inspect
+```
+
+Suggested layout:
+
+```
+examples/host_app/
+  host_app.py
+  fixtures/
+  .host_store/
+    raw/
+    manifests/
+  README.md
+```
+
+The fixture models the host contract without requiring a real connector, real object store, real search index, or real scheduler.
+
+Host fixture API:
+
+```python
+class TestHostApp:
+    def stage_batch(self, items: list[HostSourceItem]) -> None:
+        ...
+
+    def write_source_manifest(
+        self,
+        *,
+        mode: Literal["authoritative_snapshot", "incremental_delta"],
+    ) -> Path:
+        ...
+
+    def run_strata(self) -> ApplyResult:
+        ...
+```
+
+Test scenarios:
+
+- Initial authoritative ingest: stage files across multiple batches, write one complete manifest, run Strata, assert all expected asset/sink rows exist.
+- Idempotent rerun: same manifest and content hashes produce an empty plan or full cache reuse.
+- One changed file: same item key with a new content hash rebuilds only that file lineage.
+- Authoritative delete: previously known item missing from an authoritative manifest emits delete operations and deactivates/removes sink documents.
+- Incremental delta: manifest containing only changed items does not delete absent items.
+- Explicit delta delete: manifest item with `deleted: true` deletes/tombstones that source lineage.
+- Partial failure: one bad staged object fails while successful items remain materialized and retryable.
+- Host-created project observability: after a host run, `strata inspect`, `strata progress`, and `strata docs build/serve` can inspect the project by project id/name once the project registry exists.
+
+Implementation should happen in two passes:
+
+1. Use generated local project config while `object_manifest` and source plugins are introduced.
+2. Switch to the library-first API and project registry once those exist, removing the need for a temporary YAML file.
+
 ---
 
 ## 7. Implementation phases
@@ -577,14 +954,26 @@ Phase 1B local plugin registry is implemented. The executor dispatches parsers, 
 
 **Goal:** The things that make people trust it in production.
 
+- External plugin discovery via Python package entry points, so parser/chunker/embedder/sink plugins can ship outside the core package.
+- Plugin metadata and compatibility checks: plugin type, supported asset kinds, config schema, dependency requirements, and declared Strata API version.
 - `strata test` — asset-level assertions (no empty chunks, embedding dims match model, parent_doc_id present, ≥X% of docs produced chunks).
-- `strata docs serve` — DAG browser + per-instance lineage trace (source → parse → chunk → embed) with fingerprints visible. This is the retrieval-quality debugging tool and a key differentiator.
-- Cost estimation in `plan` (per-asset, distinguishing free local compute from paid embedding/LLM calls).
+- `strata inspect` — CLI-first per-instance debug view showing fingerprints, transform/config identity, artifact preview, upstream lineage, and downstream sink linkage.
+- `strata docs build` / `strata docs serve` — searchable asset browser + per-instance lineage trace (source → parse → chunk → embed) with fingerprints visible. This is the retrieval-quality debugging tool and a key differentiator.
 - Declarative YAML surface compiling to the same manifest.
 - Partial-failure handling: one instance failing does not fail the run; failed instances are retried on next apply.
 - Determinism classes wired into cache behavior.
 
-**Exit criterion:** A team can debug "why is this chunk in the results" via the docs UI, and trust `plan` to tell the truth about cost and scope before spending money.
+**Exit criterion:** A team can debug "why is this chunk in the results" via the docs UI, and trust `plan` to tell the truth about rebuild scope before running apply.
+
+**Current status:** Phase 2A is implemented. External parser/chunker/embedder/sink discovery uses Python entry point groups (`strata.parsers`, `strata.chunkers`, `strata.embedders`, `strata.sinks`) and records basic plugin metadata. `strata test` is implemented with declarative YAML tests and built-in assertions for materialized assets, non-empty artifacts, embedding dimensions, and source identity metadata.
+
+Phase 2B is implemented as a CLI-first inspection layer. `strata inspect` assembles state rows, transform metadata, lineage edges, artifact payload previews, embedding dimensions, and local sink linkage into a human-readable or JSON report.
+
+Phase 2C is implemented as a static asset browser. `strata docs build` writes `index.html`, `styles.css`, `app.js`, and `data.json`; `strata docs serve` rebuilds and serves that static site locally. The browser supports asset/status filters, text search across keys/hashes/previews, per-instance identity details, previews, and clickable upstream/downstream lineage.
+
+Future docs enhancement: add an interactive lineage graph view for the selected instance and its neighborhood, so users can visually follow source -> parsed -> chunks -> embeddings -> sinks in addition to the current linked lists.
+
+Richer test plugins and stronger compatibility enforcement remain deferred.
 
 ### Phase 3 — Executor adapters and scale
 
@@ -592,7 +981,9 @@ Phase 1B local plugin registry is implemented. The executor dispatches parsers, 
 
 - Executor adapters: Temporal (durability/retries/scheduling), Dagster (`dagster-strata`), Prefect.
 - Artifact store abstraction (local fs + S3) so intermediate artifacts (parsed markdown, chunk parquet) are the source of truth and the vector store is a rebuildable downstream sink.
-- Per-asset scheduling (re-embed daily, re-summarize weekly) expressed declaratively.
+- (To consider) Option to use Iceberg as storage.
+- Cost estimation in `plan` for paid parser, embedding, and LLM operations, using plugin-provided estimators where available.
+- Per-asset scheduling (re-embed daily, re-summarize weekly) expressed declaratively. Scheduling should be optional, because a lot of use cases will have Strata runs orchestrated by external scheduler.
 - Multi-tenant and multi-project operations hardened (isolation, per-tenant/project plan/apply, bulk reprocessing across tenants).
 
 **Exit criterion:** Strata runs as the build-system layer on top of an existing Temporal or Dagster deployment, not as a replacement for it.

@@ -1,36 +1,32 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any, cast
 
-from strata.hashing import config_hash, hash_canonical, input_fingerprint, sha256_text
-from strata.models import (
-    ArtifactEnvelope,
-    ArtifactInputs,
-    ArtifactOutput,
-    ArtifactSource,
-    ArtifactTransform,
-    ArtifactUpstream,
+from strata.core.collections import ArtifactPayload, ArtifactWrite
+from strata.core.hashing import config_hash, hash_canonical, input_fingerprint, sha256_text
+from strata.core.models import (
     AssetInstanceCommit,
-    FanoutManifest,
-    FanoutManifestItem,
-    FanoutManifestParent,
-    FanoutManifestPayload,
+    ChunkRef,
+    EmbeddingRef,
+    HybridChunkEmbeddingItem,
     Manifest,
     MaterializedArtifact,
     Operation,
     OperationItemStatus,
     SourceItem,
+    SourceRef,
     SourceSnapshot,
 )
-from strata.plugins import get_chunker, get_embedder, get_parser, get_sink
-from strata.state import StateRepository
-from strata.transforms import MissingPdfParserError, artifact_payload
-
-ARTIFACT_URI_PREFIX = "artifact://"
+from strata.execution.artifacts import (
+    artifact_source,
+    read_artifact,
+    write_many_artifacts,
+    write_one_artifact,
+)
+from strata.plugins.registry import get_chunker, get_embedder, get_parser, get_sink
+from strata.state.repository import StateRepository
 
 
 class ApplyResult(dict[str, Any]):
@@ -97,7 +93,7 @@ def apply_operations(
         for snapshot in source_snapshots.values():
             repo.update_source_checkpoint(
                 snapshot.source_name,
-                connection_id="local",
+                connection_id=snapshot.connection_id,
                 scope_hash_value=snapshot.scope_hash,
                 cursor_token={"scan_marker": snapshot.scan_marker},
             )
@@ -125,156 +121,6 @@ def _transform_id(manifest: Manifest, repo: StateRepository, asset_name: str, cf
         config_json=json.dumps(asset.config, sort_keys=True),
         config_hash_value=cfg_hash,
         determinism=asset.determinism.value,
-    )
-
-
-def _artifact_path(manifest: Manifest, asset_name: str, fingerprint: str) -> Path:
-    return manifest.artifacts_path / asset_name / f"{fingerprint}.json"
-
-
-def _fanout_dir(manifest: Manifest, asset_name: str, parent_fingerprint: str) -> Path:
-    return manifest.artifacts_path / asset_name / parent_fingerprint
-
-
-def _fanout_item_uri(
-    asset_name: str, parent_fingerprint: str, manifest_name: str, item: int
-) -> str:
-    return (
-        f"{ARTIFACT_URI_PREFIX}{asset_name}/{parent_fingerprint}/"
-        f"manifests/{manifest_name}#item={item}"
-    )
-
-
-def _write_artifact(path: Path, payload: str) -> str:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(payload, encoding="utf-8")
-    return sha256_text(payload)
-
-
-def _write_immutable_text(path: Path, payload: str) -> str:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        existing = path.read_text(encoding="utf-8")
-        if existing != payload:
-            raise ValueError(f"immutable artifact already exists with different content: {path}")
-    else:
-        with path.open("x", encoding="utf-8", newline="\n") as handle:
-            handle.write(payload)
-    return sha256_text(payload)
-
-
-def _write_fanout_manifest(
-    *,
-    manifest: Manifest,
-    asset_name: str,
-    parent: MaterializedArtifact,
-    transform: ArtifactTransform,
-    source: ArtifactSource,
-    upstreams: list[ArtifactUpstream],
-    items: list[FanoutManifestItem],
-) -> str:
-    created_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    manifest_doc = FanoutManifest(
-        created_at=created_at,
-        asset_name=asset_name,
-        parent=FanoutManifestParent(
-            asset_name=parent.asset_name,
-            instance_key=parent.instance_key,
-            input_fingerprint=parent.input_fingerprint,
-        ),
-        transform=transform,
-        source=source,
-        upstreams=upstreams,
-        items=items,
-    )
-    hash_payload = manifest_doc.model_dump(mode="json")
-    hash_payload.pop("manifest_hash", None)
-    manifest_hash = hash_canonical(hash_payload)
-    manifest_doc = manifest_doc.model_copy(update={"manifest_hash": manifest_hash})
-    manifest_name = f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}-{manifest_hash[:12]}.json"
-    manifest_path = (
-        _fanout_dir(manifest, asset_name, parent.input_fingerprint) / "manifests" / manifest_name
-    )
-    _write_immutable_text(manifest_path, manifest_doc.model_dump_json(indent=2))
-    return manifest_name
-
-
-def _read_artifact(manifest: Manifest, location: str | None) -> dict[str, Any]:
-    if not location:
-        raise ValueError("artifact has no output location")
-    if location.startswith(ARTIFACT_URI_PREFIX):
-        return _read_fanout_record(manifest, location)
-    return cast(dict[str, Any], json.loads(Path(location).read_text(encoding="utf-8")))
-
-
-def _read_fanout_record(manifest: Manifest, location: str) -> dict[str, Any]:
-    uri = location.removeprefix(ARTIFACT_URI_PREFIX)
-    if "#item=" not in uri:
-        raise ValueError(f"invalid artifact URI: {location}")
-    manifest_ref, item_ref = uri.split("#item=", 1)
-    item_number = int(item_ref)
-    manifest_path = manifest.artifacts_path / manifest_ref
-    manifest_doc = cast(
-        dict[str, Any], json.loads(manifest_path.read_text(encoding="utf-8"))
-    )
-    try:
-        item = cast(dict[str, Any], manifest_doc["items"][item_number])
-    except IndexError as exc:
-        raise ValueError(f"artifact URI item does not exist: {location}") from exc
-    payload = cast(dict[str, Any], item["payload"])
-    record_number = int(payload["record"])
-    payload_path = manifest_path.parent.parent / str(payload["path"])
-    lines = payload_path.read_text(encoding="utf-8").splitlines()
-    try:
-        record = cast(dict[str, Any], json.loads(lines[record_number]))
-    except IndexError as exc:
-        raise ValueError(f"artifact URI record does not exist: {location}") from exc
-    return {
-        "artifact": {
-            "schema_version": manifest_doc["schema_version"],
-            "asset_name": manifest_doc["asset_name"],
-            "instance_key": item["instance_key"],
-            "input_fingerprint": item["input_fingerprint"],
-            "transform": manifest_doc["transform"],
-            "source": manifest_doc.get("source", {}),
-            "inputs": {"upstreams": manifest_doc.get("upstreams", [])},
-            "output": {"content_hash": item.get("content_hash")},
-        },
-        "data": record["data"],
-        "metadata": item.get("metadata", {}),
-    }
-
-
-def _artifact_source(payload: dict[str, Any]) -> dict[str, Any]:
-    source = payload.get("artifact", {}).get("source", {})
-    if not isinstance(source, dict):
-        return {}
-    return source
-
-
-def _artifact_identity(
-    *,
-    asset_name: str,
-    instance_key: str,
-    input_fingerprint_value: str,
-    transform_version: str,
-    config_hash_value: str,
-    content_hash: str | None = None,
-    upstreams: list[ArtifactUpstream] | None = None,
-    source_name: str | None = None,
-    source_item_key: str | None = None,
-) -> ArtifactEnvelope:
-    return ArtifactEnvelope(
-        asset_name=asset_name,
-        instance_key=instance_key,
-        input_fingerprint=input_fingerprint_value,
-        transform=ArtifactTransform(
-            version=transform_version,
-            config_hash=config_hash_value,
-        ),
-        source=ArtifactSource(name=source_name, item_key=source_item_key),
-        inputs=ArtifactInputs(upstreams=upstreams or []),
-        output=ArtifactOutput(content_hash=content_hash),
     )
 
 
@@ -316,31 +162,33 @@ def _execute_parsed(
         counts["reused"] += 1
         return
     try:
+        if item.path is None:
+            raise ValueError(
+                "source item has no local path; streaming object parsing is not implemented yet: "
+                f"{source_name}/{item_key}"
+            )
         text = get_parser(asset.parser or "auto").parse(item.path)
         text_hash = sha256_text(text)
-        payload = artifact_payload(
-            text,
-            {"source_path": str(item.path)},
-            _artifact_identity(
-                asset_name="parsed",
+        write_result = write_one_artifact(
+            manifest=manifest,
+            asset_name="parsed",
+            item=ArtifactWrite(
                 instance_key=item_key,
-                input_fingerprint_value=fingerprint,
-                transform_version=asset.version,
-                config_hash_value=cfg_hash,
+                input_fingerprint=fingerprint,
                 content_hash=text_hash,
-                source_name=source_name,
-                source_item_key=item_key,
+                payload=ArtifactPayload(
+                    data=text,
+                    metadata={"source_path": str(item.path), "source_uri": item.uri},
+                ),
             ),
         )
-        path = _artifact_path(manifest, "parsed", fingerprint)
-        output_hash = _write_artifact(path, payload)
         transform_id = _transform_id(manifest, repo, "parsed", cfg_hash)
         repo.write_asset_instance(
             asset_name="parsed",
             instance_key=item_key,
             input_fingerprint_value=fingerprint,
-            output_location=str(path),
-            output_hash=output_hash,
+            output_location=write_result.output_ref,
+            output_hash=write_result.output_hash,
             content_hash=text_hash,
             transform_id=transform_id,
             materialization_strategy=asset.materialization_strategy,
@@ -349,7 +197,7 @@ def _execute_parsed(
         repo.upsert_source_state(source_name, item_key, item.content_hash)
         repo.update_operation_item(op_item_id, "succeeded")
         counts["built"] += 1
-    except MissingPdfParserError as exc:
+    except Exception as exc:
         repo.update_operation_item(op_item_id, "failed", error=str(exc))
         raise
 
@@ -366,29 +214,17 @@ def _execute_chunks(
     parsed = repo.latest_materialized("parsed", item_key)
     if not parsed:
         raise ValueError(f"missing parsed artifact for {item_key}")
-    parsed_payload = _read_artifact(manifest, parsed.output_location)
+    parsed_payload = read_artifact(manifest, parsed.output_location)
     text = str(parsed_payload["data"])
-    parsed_source = _artifact_source(parsed_payload)
+    parsed_source = artifact_source(parsed_payload)
     asset = manifest.assets["chunks"]
     cfg = {"max_chars": 1200, "overlap_chars": 120, **asset.config}
     cfg_hash = config_hash(asset.config)
-    transform = ArtifactTransform(version=asset.version, config_hash=cfg_hash)
-    source = ArtifactSource(
-        name=cast(str | None, parsed_source.get("name")),
-        item_key=item_key,
-    )
+    _ = parsed_source
     chunks = get_chunker(asset.transform or asset.name).chunk(text, cfg)
     transform_id = _transform_id(manifest, repo, "chunks", cfg_hash)
-    fanout_items: list[FanoutManifestItem] = []
-    payload_records: list[str] = []
+    artifact_writes: list[ArtifactWrite] = []
     work_items: list[_FanoutWorkItem] = []
-    upstreams = [
-        ArtifactUpstream(
-            asset_name=parsed.asset_name,
-            instance_key=parsed.instance_key,
-            input_fingerprint=parsed.input_fingerprint,
-        )
-    ]
     for index, chunk_text in enumerate(chunks):
         instance_key = f"{item_key}#chunk:{index:04d}"
         chunk_hash = sha256_text(chunk_text)
@@ -409,19 +245,15 @@ def _execute_chunks(
             status="running",
         )
         cached = repo.find_materialized("chunks", instance_key, fingerprint)
-        payload_records.append(chunk_text)
-        fanout_items.append(
-            FanoutManifestItem(
+        artifact_writes.append(
+            ArtifactWrite(
                 instance_key=instance_key,
                 input_fingerprint=fingerprint,
                 content_hash=chunk_hash,
-                payload=FanoutManifestPayload(
-                    path="",
-                    format="jsonl",
-                    record=index,
-                    file_hash="",
+                payload=ArtifactPayload(
+                    data=chunk_text,
+                    metadata={"ordinal": index},
                 ),
-                metadata={"ordinal": index},
             )
         )
         work_items.append(
@@ -439,36 +271,12 @@ def _execute_chunks(
             counts["reused"] += 1
         else:
             counts["built"] += 1
-    payload_text = "".join(
-        f"{json.dumps({'data': record}, ensure_ascii=False, sort_keys=True)}\n"
-        for record in payload_records
-    )
-    payload_hash = sha256_text(payload_text)
-    payload_path = f"payloads/{payload_hash[:16]}.jsonl"
-    payload_file = _fanout_dir(manifest, "chunks", parsed.input_fingerprint) / payload_path
-    record_hashes = [
-        sha256_text(json.dumps({"data": record}, ensure_ascii=False, sort_keys=True))
-        for record in payload_records
-    ]
-    _write_immutable_text(payload_file, payload_text)
-    fanout_items = [
-        item.model_copy(
-            update={
-                "payload": item.payload.model_copy(
-                    update={"path": payload_path, "file_hash": payload_hash}
-                )
-            }
-        )
-        for item in fanout_items
-    ]
-    manifest_name = _write_fanout_manifest(
+
+    write_results = write_many_artifacts(
         manifest=manifest,
         asset_name="chunks",
-        parent=parsed,
-        transform=transform,
-        source=source,
-        upstreams=upstreams,
-        items=fanout_items,
+        partition_key=parsed.input_fingerprint,
+        items=artifact_writes,
     )
     repo.commit_asset_instances(
         [
@@ -476,10 +284,8 @@ def _execute_chunks(
                 asset_name="chunks",
                 instance_key=work_item.instance_key,
                 input_fingerprint=work_item.input_fingerprint,
-                output_location=_fanout_item_uri(
-                    "chunks", parsed.input_fingerprint, manifest_name, index
-                ),
-                output_hash=record_hashes[index],
+                output_location=write_results[index].output_ref,
+                output_hash=write_results[index].output_hash,
                 content_hash=work_item.content_hash,
                 transform_id=transform_id,
                 materialization_strategy=asset.materialization_strategy,
@@ -512,26 +318,16 @@ def _execute_embeddings(
     asset = manifest.assets["embeddings"]
     cfg = {"dimensions": 16, **asset.config}
     cfg_hash = config_hash(asset.config)
-    transform = ArtifactTransform(version=asset.version, config_hash=cfg_hash)
     transform_id = _transform_id(manifest, repo, "embeddings", cfg_hash)
     parsed = repo.latest_materialized("parsed", item_key)
     if not parsed:
         raise ValueError(f"missing parsed artifact for {item_key}")
-    parsed_source = _artifact_source(_read_artifact(manifest, parsed.output_location))
-    source = ArtifactSource(name=cast(str | None, parsed_source.get("name")), item_key=item_key)
-    fanout_items: list[FanoutManifestItem] = []
-    payload_records: list[list[float]] = []
+    parsed_source = artifact_source(read_artifact(manifest, parsed.output_location))
+    _ = parsed_source
+    artifact_writes: list[ArtifactWrite] = []
     work_items: list[_FanoutWorkItem] = []
-    upstreams = [
-        ArtifactUpstream(
-            asset_name=chunk.asset_name,
-            instance_key=chunk.instance_key,
-            input_fingerprint=chunk.input_fingerprint,
-        )
-        for chunk in chunks
-    ]
     for chunk in chunks:
-        chunk_payload = _read_artifact(manifest, chunk.output_location)
+        chunk_payload = read_artifact(manifest, chunk.output_location)
         chunk_text = str(chunk_payload["data"])
         fingerprint = input_fingerprint(
             transform_version=asset.version,
@@ -552,20 +348,15 @@ def _execute_embeddings(
         cached = repo.find_materialized("embeddings", chunk.instance_key, fingerprint)
         embedding = get_embedder(asset.transform or asset.name).embed(chunk_text, cfg)
         embedding_hash = hash_canonical(embedding)
-        record = int(chunk.metadata.get("ordinal", len(fanout_items)))
-        payload_records.append(embedding)
-        fanout_items.append(
-            FanoutManifestItem(
+        artifact_writes.append(
+            ArtifactWrite(
                 instance_key=chunk.instance_key,
                 input_fingerprint=fingerprint,
                 content_hash=embedding_hash,
-                payload=FanoutManifestPayload(
-                    path="",
-                    format="jsonl",
-                    record=record,
-                    file_hash="",
+                payload=ArtifactPayload(
+                    data=embedding,
+                    metadata={"chunk_instance_key": chunk.instance_key},
                 ),
-                metadata={"chunk_instance_key": chunk.instance_key},
             )
         )
         work_items.append(
@@ -583,36 +374,12 @@ def _execute_embeddings(
             counts["reused"] += 1
         else:
             counts["built"] += 1
-    payload_text = "".join(
-        f"{json.dumps({'data': record}, ensure_ascii=False, sort_keys=True)}\n"
-        for record in payload_records
-    )
-    payload_hash = sha256_text(payload_text)
-    payload_path = f"payloads/{payload_hash[:16]}.jsonl"
-    payload_file = _fanout_dir(manifest, "embeddings", parsed.input_fingerprint) / payload_path
-    record_hashes = [
-        sha256_text(json.dumps({"data": record}, ensure_ascii=False, sort_keys=True))
-        for record in payload_records
-    ]
-    _write_immutable_text(payload_file, payload_text)
-    fanout_items = [
-        item.model_copy(
-            update={
-                "payload": item.payload.model_copy(
-                    update={"path": payload_path, "file_hash": payload_hash}
-                )
-            }
-        )
-        for item in fanout_items
-    ]
-    manifest_name = _write_fanout_manifest(
+
+    write_results = write_many_artifacts(
         manifest=manifest,
         asset_name="embeddings",
-        parent=parsed,
-        transform=transform,
-        source=source,
-        upstreams=upstreams,
-        items=fanout_items,
+        partition_key=parsed.input_fingerprint,
+        items=artifact_writes,
     )
     repo.commit_asset_instances(
         [
@@ -620,10 +387,8 @@ def _execute_embeddings(
                 asset_name="embeddings",
                 instance_key=work_item.instance_key,
                 input_fingerprint=work_item.input_fingerprint,
-                output_location=_fanout_item_uri(
-                    "embeddings", parsed.input_fingerprint, manifest_name, index
-                ),
-                output_hash=record_hashes[index],
+                output_location=write_results[index].output_ref,
+                output_hash=write_results[index].output_hash,
                 content_hash=work_item.content_hash,
                 transform_id=transform_id,
                 materialization_strategy=asset.materialization_strategy,
@@ -657,19 +422,23 @@ def _execute_sink(
     cfg_hash = config_hash(asset.config)
     transform_id = _transform_id(manifest, repo, "sink", cfg_hash)
     for embedding_artifact in embeddings:
-        embedding_payload = _read_artifact(manifest, embedding_artifact.output_location)
+        embedding_payload = read_artifact(manifest, embedding_artifact.output_location)
         embedding = embedding_payload["data"]
-        embedding_source = _artifact_source(embedding_payload)
+        embedding_source = artifact_source(embedding_payload)
         chunk_key = embedding_artifact.instance_key
-        chunk = repo.latest_materialized("chunks", chunk_key)
-        chunk_payload = _read_artifact(manifest, chunk.output_location if chunk else None)
+        chunk = next(iter(repo.upstream_artifacts(embedding_artifact.id, "chunks")), None)
+        if chunk is None:
+            chunk = repo.latest_materialized("chunks", chunk_key)
+        if chunk is None:
+            raise ValueError(f"missing chunk artifact for {chunk_key}")
+        chunk_payload = read_artifact(manifest, chunk.output_location)
         chunk_text = str(chunk_payload["data"])
         fingerprint = input_fingerprint(
             transform_version=asset.version,
             config_hash_value=cfg_hash,
             determinism=asset.determinism.value,
             instance_key=chunk_key,
-            upstream_fingerprints=[embedding_artifact.input_fingerprint],
+            upstream_fingerprints=[chunk.input_fingerprint, embedding_artifact.input_fingerprint],
         )
         op_item_id = repo.create_operation_item(
             run_id=run_id,
@@ -685,20 +454,51 @@ def _execute_sink(
             repo.update_operation_item(op_item_id, "skipped")
             counts["reused"] += 1
             continue
-        get_sink(asset.type or asset.name).write(
+        sink = get_sink(asset.type or asset.name)
+        source_ref = SourceRef(
+            name=cast(str | None, embedding_source.get("name")),
+            item_key=item_key,
+            content_hash=cast(str | None, embedding_source.get("content_hash")),
+            metadata=dict(chunk_payload.get("metadata") or {}),
+        )
+        hybrid_item = HybridChunkEmbeddingItem(
+            context=manifest.context,
+            source=source_ref,
+            chunk=ChunkRef(
+                instance_key=chunk.instance_key,
+                fingerprint=chunk.input_fingerprint,
+                content_hash=chunk.content_hash,
+                text=chunk_text,
+                metadata=chunk.metadata,
+            ),
+            embedding=EmbeddingRef(
+                instance_key=embedding_artifact.instance_key,
+                fingerprint=embedding_artifact.input_fingerprint,
+                content_hash=embedding_artifact.content_hash,
+                vector=cast(list[float], embedding),
+                metadata=embedding_artifact.metadata,
+            ),
+            document_id=chunk_key,
+            metadata={
+                "source_item_key": item_key,
+                "chunk_instance_key": chunk_key,
+            },
+        )
+        sink.write(
             repo=repo,
             instance_key=chunk_key,
             embedding_fingerprint=embedding_artifact.input_fingerprint,
             source_item_key=item_key,
             chunk_text=chunk_text,
-            embedding=embedding,
+            embedding=cast(list[float], embedding),
         )
+        sink_result = sink.write_hybrid(item=hybrid_item, config=asset.config)
         sink_instance = repo.write_asset_instance(
             asset_name="sink",
             instance_key=chunk_key,
             input_fingerprint_value=fingerprint,
-            output_location=f"sqlite://local_vector_sink/{chunk_key}",
-            output_hash=hash_canonical({"chunk": chunk_key, "embedding": embedding}),
+            output_location=sink_result.output_location,
+            output_hash=sink_result.output_hash,
             content_hash=None,
             transform_id=transform_id,
             materialization_strategy="sink",
@@ -709,6 +509,7 @@ def _execute_sink(
                 "chunk_instance_key": chunk_key,
             },
         )
+        repo.write_lineage(chunk.id, sink_instance.id)
         repo.write_lineage(embedding_artifact.id, sink_instance.id)
         repo.update_operation_item(op_item_id, "succeeded")
         counts["built"] += 1

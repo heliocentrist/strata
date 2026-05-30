@@ -1,12 +1,12 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pathlib import Path
 
 import pytest
 from conftest import write_project
 
-from strata.config import load_manifest
-from strata.selectors import parse_selection
+from strata.core.config import load_manifest
+from strata.core.selectors import parse_selection
 
 
 def test_asset_selector_shapes(tmp_path: Path) -> None:

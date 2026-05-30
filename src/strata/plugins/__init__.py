@@ -1,0 +1,1 @@
+"""Plugin adapter modules."""

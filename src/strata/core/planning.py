@@ -1,8 +1,15 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
-from strata.hashing import config_hash, input_fingerprint
-from strata.models import CurrentState, Manifest, Operation, OperationScope, SourceSnapshot
-from strata.selectors import parse_selection
+from strata.core.hashing import config_hash, input_fingerprint
+from strata.core.models import (
+    CurrentState,
+    Manifest,
+    Operation,
+    OperationScope,
+    SourceSnapshot,
+    SourceSnapshotMode,
+)
+from strata.core.selectors import parse_selection
 
 
 def plan(
@@ -19,11 +26,29 @@ def plan(
         for snapshot in source_snapshots.values()
         for item in snapshot.items
     }
+    authoritative_sources = {
+        snapshot.source_name
+        for snapshot in source_snapshots.values()
+        if snapshot.mode == SourceSnapshotMode.AUTHORITATIVE
+    }
 
     for source_name, item_key in sorted(source_items):
         if selected.source_names is not None and source_name not in selected.source_names:
             continue
         item = source_items[(source_name, item_key)]
+        if item.deleted:
+            if "sink" in selected.assets:
+                operations.append(
+                    _operation(
+                        manifest,
+                        op_type="delete_scope",
+                        asset_name="sink",
+                        item_key=item_key,
+                        source_name=source_name,
+                        reason="source_deleted",
+                    )
+                )
+            continue
         old_hash = current_state.source_hashes.get((source_name, item_key))
         if old_hash is None:
             root_reason = "new_source"
@@ -82,7 +107,7 @@ def plan(
             config_hash_value=config_hash(sink_asset.config),
             determinism=sink_asset.determinism.value,
             instance_key=first_chunk_key,
-            upstream_fingerprints=[embeddings_fingerprint],
+            upstream_fingerprints=[chunks_fingerprint, embeddings_fingerprint],
         )
         sink_current = ("sink", first_chunk_key, sink_fingerprint) in current_state.materialized
         sink_reason = root_reason or embeddings_reason or (
@@ -136,8 +161,10 @@ def plan(
             )
 
     current_source_keys = set(current_state.source_hashes)
-    observed_keys = set(source_items)
+    observed_keys = {key for key, item in source_items.items() if not item.deleted}
     for source_name, item_key in sorted(current_source_keys - observed_keys):
+        if source_name not in authoritative_sources:
+            continue
         if selected.source_names is not None and source_name not in selected.source_names:
             continue
         if "sink" in selected.assets:

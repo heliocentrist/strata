@@ -1,12 +1,13 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 import yaml
 
-from strata.hashing import hash_canonical
-from strata.models import AssetSpec, ExecutionContext, Manifest, SourceSpec
+from strata.core.hashing import hash_canonical
+from strata.core.models import AssetSpec, ExecutionContext, Manifest, SourceSpec, TestSpec
 
 AssetKind = Literal["parsed", "chunks", "embeddings", "sink"]
 
@@ -30,12 +31,14 @@ def load_manifest(project_file: Path) -> Manifest:
 
     sources = {}
     for name, spec in raw.get("sources", {}).items():
-        source_values = {k: v for k, v in spec.items() if k != "path"}
-        sources[name] = SourceSpec(
-            name=name,
-            path=(root / spec["path"]).resolve(),
-            **source_values,
-        )
+        source_values = dict(spec)
+        if "path" in source_values:
+            source_values["path"] = (root / source_values["path"]).resolve()
+        if "manifest_uri" in source_values:
+            source_values["manifest_uri"] = _resolve_project_uri(
+                str(source_values["manifest_uri"]), root
+            )
+        sources[name] = SourceSpec(name=name, **source_values)
     if not sources:
         raise ValueError("strata.yml must define at least one source")
 
@@ -63,12 +66,14 @@ def load_manifest(project_file: Path) -> Manifest:
 
     state_url = raw.get("state", {}).get("url", "sqlite:///./.strata/state.db")
     artifacts_path = (root / raw.get("artifacts", {}).get("path", "./.strata/artifacts")).resolve()
+    tests = _parse_tests(raw.get("tests", []), assets)
 
     manifest_payload: dict[str, Any] = {
         "project_id": context.project_id,
         "tenant_id": context.tenant_id,
         "sources": {name: spec.model_dump(mode="json") for name, spec in sources.items()},
         "assets": {name: spec.model_dump(mode="json") for name, spec in assets.items()},
+        "tests": [spec.model_dump(mode="json") for spec in tests],
     }
     return Manifest(
         context=context,
@@ -78,6 +83,7 @@ def load_manifest(project_file: Path) -> Manifest:
         sources=sources,
         assets=assets,
         asset_order=asset_order,
+        tests=tests,
         manifest_hash=hash_canonical(manifest_payload),
     )
 
@@ -90,8 +96,49 @@ def _validate_pipeline(assets: dict[str, AssetSpec], sources: dict[str, SourceSp
         raise ValueError("chunks.input must be 'parsed'")
     if assets["embeddings"].input != "chunks":
         raise ValueError("embeddings.input must be 'chunks'")
-    if assets["sink"].input != "embeddings":
+    sink = assets["sink"]
+    if sink.inputs:
+        if sink.inputs.get("chunk") != "chunks" or sink.inputs.get("embedding") != "embeddings":
+            raise ValueError("sink.inputs must map chunk: chunks and embedding: embeddings")
+    elif sink.input != "embeddings":
         raise ValueError("sink.input must be 'embeddings'")
+
+
+def _resolve_project_uri(value: str, root: Path) -> str:
+    parsed = urlparse(value)
+    if parsed.scheme:
+        return value
+    path = Path(value)
+    if not path.is_absolute():
+        path = root / path
+    return str(path.resolve())
+
+
+def _parse_tests(raw_tests: Any, assets: dict[str, AssetSpec]) -> list[TestSpec]:
+    if raw_tests is None:
+        return []
+    if not isinstance(raw_tests, list):
+        raise ValueError("tests must be a list")
+
+    tests: list[TestSpec] = []
+    for index, raw_test in enumerate(raw_tests):
+        if not isinstance(raw_test, dict):
+            raise ValueError("each test must be an object")
+        asset = str(raw_test.get("asset", ""))
+        test_type = str(raw_test.get("type", ""))
+        if asset not in assets:
+            raise ValueError(f"test {index} references unknown asset: {asset}")
+        if not test_type:
+            raise ValueError(f"test {index} must define type")
+        tests.append(
+            TestSpec(
+                name=str(raw_test.get("name") or f"{asset}:{test_type}"),
+                asset=asset,
+                type=test_type,
+                config=dict(raw_test.get("config") or {}),
+            )
+        )
+    return tests
 
 
 def state_path_from_url(state_url: str, root: Path) -> Path:

@@ -1,6 +1,6 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
-from strata.hashing import config_hash, input_fingerprint
+from strata.core.hashing import config_hash, input_fingerprint
 
 
 def test_config_hash_is_canonical() -> None:

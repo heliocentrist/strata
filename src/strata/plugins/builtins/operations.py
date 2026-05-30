@@ -1,10 +1,7 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from typing import Any
-
-from strata.models import ArtifactDocument, ArtifactEnvelope
 
 
 class MissingPdfParserError(RuntimeError):
@@ -76,12 +73,3 @@ def fake_embedding(text: str, *, dimensions: int) -> list[float]:
             values.append((integer / 2**32) * 2 - 1)
         counter += 1
     return values
-
-
-def artifact_payload(
-    data: Any,
-    metadata: dict[str, Any],
-    artifact: ArtifactEnvelope,
-) -> str:
-    document = ArtifactDocument(artifact=artifact, data=data, metadata=metadata)
-    return document.model_dump_json(indent=2)

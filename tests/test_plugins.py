@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
@@ -7,12 +7,16 @@ import pytest
 from conftest import write_project
 from sqlalchemy import select
 
-from strata.config import load_manifest, state_path_from_url
-from strata.executor import apply_operations
-from strata.planner import plan
-from strata.plugins import get_chunker, get_parser, register_chunker
-from strata.source import snapshot_sources
-from strata.state import StateRepository, bootstrap, connect_state, vector_sink
+from strata.core.config import load_manifest, state_path_from_url
+from strata.core.planning import plan
+from strata.executors.local import apply_operations
+from strata.plugins.discovery import discover_external_plugins
+from strata.plugins.protocols import AdapterMetadata
+from strata.plugins.registry import get_chunker, get_parser, register_chunker, registered_plugins
+from strata.sources.registry import snapshot_sources
+from strata.state.connection import bootstrap, connect_state
+from strata.state.repository import StateRepository
+from strata.state.schema import vector_sink
 
 
 class OneChunker:
@@ -63,3 +67,42 @@ def test_parser_adapters_are_pipeline_selectable(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="only supports .md"):
         get_parser("markdown_noop").parse(txt)
     assert get_parser("liteparse").parse(txt) == "Plain text\n"
+
+
+def test_external_plugin_discovery_registers_entry_points(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class ExternalParser:
+        def parse(self, path: Path) -> str:
+            return path.read_text(encoding="utf-8").upper()
+
+    class FakeEntryPoint:
+        name = "external_markdown"
+        value = "fake.module:ExternalParser"
+
+        def load(self) -> type[ExternalParser]:
+            return ExternalParser
+
+    class FakeEntryPoints:
+        def select(self, *, group: str) -> list[FakeEntryPoint]:
+            if group == "strata.parsers":
+                return [FakeEntryPoint()]
+            return []
+
+    monkeypatch.setattr("strata.plugins.discovery.entry_points", lambda: FakeEntryPoints())
+
+    result = discover_external_plugins(force=True)
+
+    assert result.errors == []
+    assert result.loaded == [
+        AdapterMetadata(
+            name="external_markdown",
+            kind="parser",
+            source="entry_point:strata.parsers:fake.module:ExternalParser",
+            supported_asset_kinds=("parsed",),
+        )
+    ]
+    doc = tmp_path / "external.md"
+    doc.write_text("plugin text", encoding="utf-8")
+    assert get_parser("external_markdown").parse(doc) == "PLUGIN TEXT"
+    assert any(plugin.name == "external_markdown" for plugin in registered_plugins())

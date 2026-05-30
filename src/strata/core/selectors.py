@@ -1,8 +1,8 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from strata.models import Manifest
+from strata.core.models import Manifest
 
 
 class Selection(BaseModel):

@@ -38,3 +38,16 @@ pipeline:
     input: embeddings
     type: local_sqlite_vector_sink
     version: sink@0.1.0
+
+tests:
+  - name: chunks_not_empty
+    asset: chunks
+    type: not_empty
+
+  - name: embeddings_have_expected_dimensions
+    asset: embeddings
+    type: embedding_dimensions
+
+  - name: chunks_keep_source_identity
+    asset: chunks
+    type: source_item_key_present
