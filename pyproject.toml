@@ -2,7 +2,7 @@
 name = "strata"
 version = "0.1.0"
 description = "Content-addressed build system for local RAG preparation pipelines"
-readme = "strata-implementation-plan.md"
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "liteparse>=2,<3",

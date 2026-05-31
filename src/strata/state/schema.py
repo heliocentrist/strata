@@ -38,6 +38,8 @@ asset_instances = Table(
     Column("tenant_id", String, nullable=False),
     Column("asset_name", String, nullable=False),
     Column("instance_key", String, nullable=False),
+    Column("source_name", String),
+    Column("source_item_key", String),
     Column("input_fingerprint", String, nullable=False),
     Column("output_location", Text),
     Column("output_hash", String),
@@ -63,6 +65,15 @@ Index(
     asset_instances.c.tenant_id,
     asset_instances.c.asset_name,
     asset_instances.c.instance_key,
+    asset_instances.c.status,
+)
+Index(
+    "ix_asset_instances_source_scope",
+    asset_instances.c.project_id,
+    asset_instances.c.tenant_id,
+    asset_instances.c.asset_name,
+    asset_instances.c.source_name,
+    asset_instances.c.source_item_key,
     asset_instances.c.status,
 )
 

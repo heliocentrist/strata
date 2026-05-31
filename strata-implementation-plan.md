@@ -16,6 +16,8 @@ Strata is to unstructured content what dbt is to SQL transformations: a build sy
 
 Phase 0A now exists as a working local fixture. The package includes `compile`, `plan`, `apply`, `progress`, `lineage`, `doctor`, `test`, `inspect`, and `docs`; SQLite state; local file and object-manifest sources; pipeline-configured operation plugins; deterministic chunking; fake deterministic embeddings; a local SQLite sink; operation progress; lineage; deletes; apply locks; and tests.
 
+Discoverable sources are the default UX. Users can point Strata at a local folder or local object-store folder and Strata enumerates source items before planning, computes item keys and content hashes, and compares them with `source_state` for full-load and delta behavior. Source manifests remain an advanced host-staged integration path for systems that cannot expose a listable scope.
+
 The artifact store design evolved during implementation. Fanout assets now use an Iceberg-inspired immutable snapshot model: payload JSONL files are immutable, fanout manifests are immutable and content-addressed, and the database is the catalog that commits asset instances to a specific manifest item. The physical artifact layout is behind an artifact collection plugin (`local_json`) rather than hard-coded in the core.
 
 Apply semantics now live in the Strata runtime, not in executor plugins. Execution substrate is selected through an operation-runner registry. The built-in runners are `local_single_thread` and `local_threaded`; both share the same Strata cache/lineage/artifact commit semantics, while `local_threaded` parallelizes plugin invocations where the runtime can safely batch them.

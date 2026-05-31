@@ -437,11 +437,28 @@ def _scope_artifacts(
     manifest: Manifest,
     repo: StateRepository,
     asset_name: str,
+    source_name: str | None,
     source_item_key: str,
 ) -> list[MaterializedArtifact]:
     direct = repo.latest_materialized(asset_name, source_item_key)
     if direct:
         return [direct]
+
+    if source_name is not None:
+        scoped_by_id: dict[str, MaterializedArtifact] = {}
+        for root_name in _source_roots_for_asset(manifest, manifest.assets[asset_name]):
+            root = repo.latest_materialized(root_name, source_item_key)
+            if root is None:
+                continue
+            for artifact in repo.materialized_descendants_for_source_scope(
+                root.id,
+                asset_name=asset_name,
+                source_name=source_name,
+                source_item_key=source_item_key,
+            ):
+                scoped_by_id[artifact.id] = artifact
+        if scoped_by_id:
+            return sorted(scoped_by_id.values(), key=lambda artifact: artifact.instance_key)
 
     artifacts_by_id: dict[str, MaterializedArtifact] = {}
     for root_name in _source_roots_for_asset(manifest, manifest.assets[asset_name]):
@@ -551,6 +568,7 @@ def _artifact_operation_input(
         metadata=artifact.metadata,
         input_fingerprint=artifact.input_fingerprint,
         content_hash=artifact.content_hash,
+        source_name=artifact.source_name,
         artifact_location=artifact.output_location,
         partition_key=partition_key or artifact.input_fingerprint,
     )
@@ -806,7 +824,13 @@ def _build_input_groups_for_item(
         )
         return
     if asset.input:
-        upstreams = _scope_artifacts(manifest, repo, asset.input, item_key)
+        upstreams = _scope_artifacts(
+            manifest,
+            repo,
+            asset.input,
+            operation.scope.source_name,
+            item_key,
+        )
         if not upstreams:
             raise ValueError(f"missing {asset.input} artifacts for {item_key}")
         partition_key = _partition_key_for_scope(manifest, repo, asset, item_key, upstreams)
@@ -857,7 +881,17 @@ def _artifact_group(
         upstreams=[artifact],
         operation_run_id=operation_run_id,
         partition_key=partition_key,
+        source_name=artifact.source_name,
     )
+
+
+def _group_source_identity(group: _InputGroup) -> tuple[str | None, str | None]:
+    if group.source_name is not None and group.source_item is not None:
+        return group.source_name, group.source_item.item_key
+    for upstream in group.upstreams:
+        if upstream.source_name is not None and upstream.source_item_key is not None:
+            return upstream.source_name, upstream.source_item_key
+    return group.source_name, group.item_key or None
 
 
 def _commit_output_batch(
@@ -1001,6 +1035,7 @@ def _commit_external_outputs(
     )
     source_outputs = [output for output in outputs if not output.group.upstreams]
     for output in source_outputs:
+        source_name, source_item_key = _group_source_identity(output.group)
         repo.write_asset_instance(
             asset_name=asset.name,
             instance_key=output.instance_key,
@@ -1010,6 +1045,8 @@ def _commit_external_outputs(
             content_hash=output.content_hash,
             transform_id=transform_id,
             materialization_strategy=asset.materialization_strategy,
+            source_name=source_name,
+            source_item_key=source_item_key,
             metadata_value=output.metadata,
         )
         repo.update_operation_item(output.op_item_id, "succeeded")
@@ -1023,6 +1060,8 @@ def _commit_external_outputs(
                     instance_key=output.instance_key,
                     input_fingerprint=output.input_fingerprint,
                     output_location=output.output_location,
+                    source_name=_group_source_identity(output.group)[0],
+                    source_item_key=_group_source_identity(output.group)[1],
                     output_hash=output.output_hash,
                     content_hash=output.content_hash,
                     transform_id=transform_id,

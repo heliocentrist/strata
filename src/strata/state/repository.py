@@ -40,6 +40,21 @@ def new_id() -> str:
     return str(uuid.uuid4())
 
 
+def _artifact_from_row(row: Any) -> MaterializedArtifact:
+    return MaterializedArtifact(
+        id=row["id"],
+        asset_name=row["asset_name"],
+        instance_key=row["instance_key"],
+        input_fingerprint=row["input_fingerprint"],
+        source_name=row["source_name"],
+        source_item_key=row["source_item_key"],
+        output_location=row["output_location"],
+        output_hash=row["output_hash"],
+        content_hash=row["content_hash"],
+        metadata=json.loads(row["metadata_json"] or "{}"),
+    )
+
+
 class StateRepository:
     def __init__(self, engine: Engine, context: ExecutionContext):
         self.engine = engine
@@ -351,16 +366,7 @@ class StateRepository:
             ).mappings().first()
         if not row:
             return None
-        return MaterializedArtifact(
-            id=row["id"],
-            asset_name=row["asset_name"],
-            instance_key=row["instance_key"],
-            input_fingerprint=row["input_fingerprint"],
-            output_location=row["output_location"],
-            output_hash=row["output_hash"],
-            content_hash=row["content_hash"],
-            metadata=json.loads(row["metadata_json"] or "{}"),
-        )
+        return _artifact_from_row(row)
 
     def latest_materialized(
         self, asset_name: str, instance_key: str
@@ -379,16 +385,81 @@ class StateRepository:
             ).mappings().first()
         if not row:
             return None
-        return MaterializedArtifact(
-            id=row["id"],
-            asset_name=row["asset_name"],
-            instance_key=row["instance_key"],
-            input_fingerprint=row["input_fingerprint"],
-            output_location=row["output_location"],
-            output_hash=row["output_hash"],
-            content_hash=row["content_hash"],
-            metadata=json.loads(row["metadata_json"] or "{}"),
-        )
+        return _artifact_from_row(row)
+
+    def materialized_for_source_scope(
+        self,
+        asset_name: str,
+        source_name: str,
+        source_item_key: str,
+    ) -> list[MaterializedArtifact]:
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                select(asset_instances)
+                .where(
+                    asset_instances.c.project_id == self.context.project_id,
+                    asset_instances.c.tenant_id == self.context.tenant_id,
+                    asset_instances.c.asset_name == asset_name,
+                    asset_instances.c.source_name == source_name,
+                    asset_instances.c.source_item_key == source_item_key,
+                    asset_instances.c.status == "materialized",
+                )
+                .order_by(asset_instances.c.instance_key)
+            ).mappings().all()
+        return [_artifact_from_row(row) for row in rows]
+
+    def materialized_descendants_for_source_scope(
+        self,
+        root_id: str,
+        *,
+        asset_name: str,
+        source_name: str,
+        source_item_key: str,
+    ) -> list[MaterializedArtifact]:
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                select(asset_instances).where(
+                    asset_instances.c.project_id == self.context.project_id,
+                    asset_instances.c.tenant_id == self.context.tenant_id,
+                    asset_instances.c.source_name == source_name,
+                    asset_instances.c.source_item_key == source_item_key,
+                    asset_instances.c.status == "materialized",
+                )
+            ).mappings().all()
+            scoped_ids = [str(row["id"]) for row in rows]
+            if not scoped_ids:
+                return []
+            edges = conn.execute(
+                select(lineage_edges).where(
+                    lineage_edges.c.upstream_asset_instance_id.in_(scoped_ids),
+                    lineage_edges.c.downstream_asset_instance_id.in_(scoped_ids),
+                )
+            ).mappings().all()
+
+        by_id = {str(row["id"]): row for row in rows}
+        downstream_by_upstream: dict[str, list[str]] = {}
+        for edge in edges:
+            upstream_id = str(edge["upstream_asset_instance_id"])
+            downstream_id = str(edge["downstream_asset_instance_id"])
+            downstream_by_upstream.setdefault(upstream_id, []).append(downstream_id)
+
+        descendants: list[Any] = []
+        seen = {root_id}
+        queue = list(downstream_by_upstream.get(root_id, []))
+        while queue:
+            instance_id = queue.pop(0)
+            if instance_id in seen:
+                continue
+            seen.add(instance_id)
+            row = by_id.get(instance_id)
+            if row is None:
+                continue
+            if row["asset_name"] == asset_name:
+                descendants.append(row)
+            queue.extend(downstream_by_upstream.get(instance_id, []))
+
+        descendants.sort(key=lambda row: row["instance_key"])
+        return [_artifact_from_row(row) for row in descendants]
 
     def write_asset_instance(
         self,
@@ -401,6 +472,8 @@ class StateRepository:
         content_hash: str | None,
         transform_id: str,
         materialization_strategy: str,
+        source_name: str | None = None,
+        source_item_key: str | None = None,
         metadata_value: dict[str, Any] | None = None,
     ) -> MaterializedArtifact:
         timestamp = now()
@@ -411,6 +484,8 @@ class StateRepository:
                 asset_name=asset_name,
                 instance_key=instance_key,
                 input_fingerprint_value=input_fingerprint_value,
+                source_name=source_name,
+                source_item_key=source_item_key,
                 output_location=output_location,
                 output_hash=output_hash,
                 content_hash=content_hash,
@@ -433,6 +508,8 @@ class StateRepository:
                     asset_name=item.asset_name,
                     instance_key=item.instance_key,
                     input_fingerprint_value=item.input_fingerprint,
+                    source_name=item.source_name,
+                    source_item_key=item.source_item_key,
                     output_location=item.output_location,
                     output_hash=item.output_hash,
                     content_hash=item.content_hash,
@@ -464,6 +541,8 @@ class StateRepository:
         asset_name: str,
         instance_key: str,
         input_fingerprint_value: str,
+        source_name: str | None,
+        source_item_key: str | None,
         output_location: str | None,
         output_hash: str | None,
         content_hash: str | None,
@@ -482,6 +561,8 @@ class StateRepository:
         ).mappings().first()
         values = {
             "output_location": output_location,
+            "source_name": source_name,
+            "source_item_key": source_item_key,
             "output_hash": output_hash,
             "content_hash": content_hash,
             "transform_id": transform_id,
@@ -515,6 +596,8 @@ class StateRepository:
             asset_name=asset_name,
             instance_key=instance_key,
             input_fingerprint=input_fingerprint_value,
+            source_name=source_name,
+            source_item_key=source_item_key,
             output_location=output_location,
             output_hash=output_hash,
             content_hash=content_hash,
@@ -571,19 +654,7 @@ class StateRepository:
             query = query.where(upstream.c.asset_name == asset_name)
         with self.engine.connect() as conn:
             rows = conn.execute(query).mappings().all()
-        return [
-            MaterializedArtifact(
-                id=row["id"],
-                asset_name=row["asset_name"],
-                instance_key=row["instance_key"],
-                input_fingerprint=row["input_fingerprint"],
-                output_location=row["output_location"],
-                output_hash=row["output_hash"],
-                content_hash=row["content_hash"],
-                metadata=json.loads(row["metadata_json"] or "{}"),
-            )
-            for row in rows
-        ]
+        return [_artifact_from_row(row) for row in rows]
 
     def materialized_descendants(
         self,
@@ -626,19 +697,7 @@ class StateRepository:
             queue.extend(downstream_by_upstream.get(instance_id, []))
 
         descendants.sort(key=lambda row: (row["asset_name"], row["instance_key"]))
-        return [
-            MaterializedArtifact(
-                id=row["id"],
-                asset_name=row["asset_name"],
-                instance_key=row["instance_key"],
-                input_fingerprint=row["input_fingerprint"],
-                output_location=row["output_location"],
-                output_hash=row["output_hash"],
-                content_hash=row["content_hash"],
-                metadata=json.loads(row["metadata_json"] or "{}"),
-            )
-            for row in descendants
-        ]
+        return [_artifact_from_row(row) for row in descendants]
 
     def _write_lineage(self, conn: Connection, upstream_id: str, downstream_id: str) -> None:
         exists = conn.execute(

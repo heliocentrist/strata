@@ -6,6 +6,7 @@ from strata.core.models import SourceSnapshot, SourceSpec
 from strata.plugins.registry import get_source, register_source
 from strata.sources.local_files import LocalFilesSourceAdapter
 from strata.sources.object_manifest import ObjectManifestSourceAdapter
+from strata.sources.object_store import ObjectStoreSourceAdapter
 
 
 def snapshot_sources(
@@ -19,6 +20,8 @@ def snapshot_sources(
 
 def register_builtin_sources() -> None:
     register_source("local_files", LocalFilesSourceAdapter())
+    register_source("object_store", ObjectStoreSourceAdapter())
+    register_source("local_object_store", ObjectStoreSourceAdapter())
     register_source("object_manifest", ObjectManifestSourceAdapter())
 
 

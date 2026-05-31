@@ -32,6 +32,7 @@ class SourceSpec(BaseModel):
     name: str
     type: str
     path: Path | None = None
+    uri: str | None = None
     manifest_uri: str | None = None
     mode: SourceSnapshotMode = SourceSnapshotMode.AUTHORITATIVE
     connection_id: str = "local"
@@ -133,6 +134,8 @@ class MaterializedArtifact(BaseModel):
     asset_name: str
     instance_key: str
     input_fingerprint: str
+    source_name: str | None = None
+    source_item_key: str | None = None
     output_location: str | None = None
     output_hash: str | None = None
     content_hash: str | None = None
@@ -144,6 +147,8 @@ class AssetInstanceCommit(BaseModel):
     instance_key: str
     input_fingerprint: str
     output_location: str
+    source_name: str | None = None
+    source_item_key: str | None = None
     output_hash: str | None = None
     content_hash: str | None = None
     transform_id: str
