@@ -158,8 +158,6 @@ def _expected_instance(
 
 
 def _asset_dependencies(asset: AssetSpec) -> list[str]:
-    if asset.inputs:
-        return list(dict(sorted(asset.inputs.items())).values())
     if asset.input:
         return [asset.input]
     return []

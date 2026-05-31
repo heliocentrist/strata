@@ -11,14 +11,13 @@ from strata.core.hashing import sha256_text
 from strata.core.operations import OperationInput, OperationOutput
 from strata.core.planning import plan
 from strata.execution.apply import apply_operations
-from strata.execution.artifacts import read_artifact
 from strata.executors.registry import get_operation_runner
 from strata.plugins.protocols import AdapterMetadata
 from strata.plugins.registry import register_operation
 from strata.sources.registry import snapshot_sources
 from strata.state.connection import bootstrap, connect_state
 from strata.state.repository import StateRepository
-from strata.state.schema import asset_instances, lineage_edges, vector_sink
+from strata.state.schema import asset_instances, vector_sink
 
 
 class LineFanoutOperation:
@@ -89,27 +88,6 @@ class SuffixMapOperation:
         ]
 
 
-class JoinSummaryOperation:
-    def run(
-        self,
-        inputs: list[OperationInput],
-        config: dict[str, Any],
-    ) -> list[OperationOutput]:
-        _ = config
-        by_role = {input_item.role: input_item for input_item in inputs}
-        left = by_role["left"]
-        right = by_role["right"]
-        data = f"{left.data}|{right.data}"
-        return [
-            OperationOutput(
-                instance_key=left.instance_key,
-                data=data,
-                parent_input_ids=[left.input_id, right.input_id],
-                content_hash=sha256_text(data),
-            )
-        ]
-
-
 class EmptyFanoutOperation:
     def run(
         self,
@@ -120,7 +98,7 @@ class EmptyFanoutOperation:
         return []
 
 
-def test_multiple_fanouts_join_sink_and_threaded_runner(tmp_path: Path) -> None:
+def test_multiple_fanouts_sink_and_threaded_runner(tmp_path: Path) -> None:
     _register_shape_operations()
     docs = tmp_path / "docs"
     docs.mkdir()
@@ -182,9 +160,7 @@ pipeline:
       dimensions: 4
 
   search:
-    inputs:
-      chunk: tokens
-      embedding: token_vectors
+    input: token_vectors
     operation: local_sqlite_vector_sink
     version: local_sqlite_vector_sink@0.1.0
 """,
@@ -286,7 +262,7 @@ def test_complex_pipeline_rebuilds_only_changed_source_scope(tmp_path: Path) -> 
     ) == []
 
 
-def test_delete_propagates_through_nested_fanouts_and_join_sink(tmp_path: Path) -> None:
+def test_delete_propagates_through_nested_fanouts_and_sink(tmp_path: Path) -> None:
     _register_shape_operations()
     project = _write_multi_fanout_project(tmp_path)
     manifest, repo = _repo(project)
@@ -363,134 +339,6 @@ def test_complex_pipeline_selectors_preserve_generic_shape(tmp_path: Path) -> No
         "search",
     ]
     assert {operation.scope.source_name for operation in source_selection} == {"docs"}
-
-
-def test_join_asset_uses_lineage_and_role_inputs_without_sink(tmp_path: Path) -> None:
-    _register_shape_operations()
-    docs = tmp_path / "docs"
-    docs.mkdir()
-    (docs / "a.md").write_text("alpha", encoding="utf-8")
-    (docs / "b.md").write_text("bravo", encoding="utf-8")
-    project = tmp_path / "strata.yml"
-    project.write_text(
-        """
-project_id: join_shape
-tenant_id: default
-
-state:
-  url: sqlite:///./.strata/state.db
-
-artifacts:
-  path: ./.strata/artifacts
-
-sources:
-  docs:
-    type: local_files
-    path: ./docs
-    include: ["**/*.md"]
-
-pipeline:
-  raw:
-    source: docs
-    operation: markdown_noop
-    version: markdown_noop@0.1.0
-
-  left_text:
-    input: raw
-    operation: test_suffix_map
-    version: test_suffix_map@0.1.0
-    config:
-      suffix: "-left"
-
-  right_text:
-    input: raw
-    operation: test_suffix_map
-    version: test_suffix_map@0.1.0
-    config:
-      suffix: "-right"
-
-  joined:
-    inputs:
-      left: left_text
-      right: right_text
-    join:
-      primary: left
-    operation: test_join_summary
-    version: test_join_summary@0.1.0
-""",
-        encoding="utf-8",
-    )
-    manifest, repo = _repo(project)
-    snapshots = snapshot_sources(manifest.sources, root=manifest.root)
-
-    operations = plan(manifest, repo.snapshot(), snapshots)
-    assert [operation.asset_name for operation in operations] == [
-        "raw",
-        "left_text",
-        "right_text",
-        "joined",
-    ]
-    result = apply_operations(
-        manifest=manifest,
-        repo=repo,
-        source_snapshots=snapshots,
-        operations=operations,
-    )
-
-    assert result["failed"] == 0
-    assert _asset_counts(repo) == {
-        "joined": 2,
-        "left_text": 2,
-        "raw": 2,
-        "right_text": 2,
-    }
-    joined_payloads = _asset_payloads(manifest, repo, "joined")
-    assert sorted(payload["data"] for payload in joined_payloads) == [
-        "alpha-left|alpha-right",
-        "bravo-left|bravo-right",
-    ]
-    with repo.engine.connect() as conn:
-        edges = conn.execute(select(lineage_edges)).all()
-    assert len(edges) == 8
-    cached_plan = plan(
-        manifest,
-        repo.snapshot(),
-        snapshot_sources(manifest.sources, root=manifest.root),
-    )
-    assert cached_plan == []
-
-
-def test_missing_join_partner_failure_is_scoped_and_inspectable(tmp_path: Path) -> None:
-    _register_shape_operations()
-    project = _write_join_project(tmp_path)
-    manifest, repo = _repo(project)
-    snapshots = snapshot_sources(manifest.sources, root=manifest.root)
-    operations = plan(
-        manifest,
-        repo.snapshot(),
-        snapshots,
-        selection="raw,left_text,joined",
-    )
-    assert [operation.asset_name for operation in operations] == [
-        "raw",
-        "left_text",
-        "joined",
-    ]
-
-    result = apply_operations(
-        manifest=manifest,
-        repo=repo,
-        source_snapshots=snapshots,
-        operations=operations,
-    )
-
-    assert result["failed"] == 1
-    assert _asset_counts(repo) == {"left_text": 2, "raw": 2}
-    with repo.engine.connect() as conn:
-        operation_rows = conn.execute(
-            select(asset_instances.c.asset_name, asset_instances.c.status)
-        ).all()
-    assert ("joined", "materialized") not in operation_rows
 
 
 def test_object_manifest_source_uses_same_generic_pipeline_path(tmp_path: Path) -> None:
@@ -866,68 +714,9 @@ pipeline:
       dimensions: 4
 
   search:
-    inputs:
-      chunk: tokens
-      embedding: token_vectors
+    input: token_vectors
     operation: local_sqlite_vector_sink
     version: local_sqlite_vector_sink@0.1.0
-""",
-        encoding="utf-8",
-    )
-    return project
-
-
-def _write_join_project(root: Path) -> Path:
-    docs = root / "docs"
-    docs.mkdir()
-    (docs / "a.md").write_text("alpha", encoding="utf-8")
-    (docs / "b.md").write_text("bravo", encoding="utf-8")
-    project = root / "strata.yml"
-    project.write_text(
-        """
-project_id: join_shape
-tenant_id: default
-
-state:
-  url: sqlite:///./.strata/state.db
-
-artifacts:
-  path: ./.strata/artifacts
-
-sources:
-  docs:
-    type: local_files
-    path: ./docs
-    include: ["**/*.md"]
-
-pipeline:
-  raw:
-    source: docs
-    operation: markdown_noop
-    version: markdown_noop@0.1.0
-
-  left_text:
-    input: raw
-    operation: test_suffix_map
-    version: test_suffix_map@0.1.0
-    config:
-      suffix: "-left"
-
-  right_text:
-    input: raw
-    operation: test_suffix_map
-    version: test_suffix_map@0.1.0
-    config:
-      suffix: "-right"
-
-  joined:
-    inputs:
-      left: left_text
-      right: right_text
-    join:
-      primary: left
-    operation: test_join_summary
-    version: test_join_summary@0.1.0
 """,
         encoding="utf-8",
     )
@@ -954,25 +743,11 @@ def _asset_counts(repo: StateRepository) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
-def _asset_payloads(
-    manifest: Any, repo: StateRepository, asset_name: str
-) -> list[dict[str, Any]]:
-    with repo.engine.connect() as conn:
-        rows = conn.execute(
-            select(asset_instances).where(
-                asset_instances.c.asset_name == asset_name,
-                asset_instances.c.status == "materialized",
-            )
-        ).mappings().all()
-    return [read_artifact(manifest, row["output_location"]) for row in rows]
-
-
 def _register_shape_operations() -> None:
     for name, operation in {
         "test_line_fanout": LineFanoutOperation(),
         "test_word_fanout": WordFanoutOperation(),
         "test_suffix_map": SuffixMapOperation(),
-        "test_join_summary": JoinSummaryOperation(),
         "test_empty_fanout": EmptyFanoutOperation(),
     }.items():
         register_operation(

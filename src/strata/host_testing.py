@@ -109,7 +109,7 @@ class TestHostApp:
                     "config": {"dimensions": 8},
                 },
                 "sink": {
-                    "inputs": {"chunk": "chunks", "embedding": "embeddings"},
+                    "input": "embeddings",
                     "operation": "local_sqlite_vector_sink",
                     "version": "local_sqlite_vector_sink@0.1.0",
                 },

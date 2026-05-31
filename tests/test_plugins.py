@@ -46,6 +46,12 @@ class RecordingBatchEmbedding:
                 instance_key=input_item.instance_key,
                 data=[float(index + 1)] * dimensions,
                 parent_input_ids=[input_item.input_id],
+                metadata={
+                    "chunk_instance_key": input_item.instance_key,
+                    "chunk_text": str(input_item.data),
+                    "source_item_key": input_item.metadata.get("source_item_key")
+                    or input_item.instance_key.split("#", 1)[0],
+                },
             )
             for index, input_item in enumerate(inputs)
         ]

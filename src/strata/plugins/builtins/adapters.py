@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import json
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, cast
+
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from strata.core.hashing import hash_canonical, sha256_text
 from strata.core.operations import OperationInput, OperationOutput
 from strata.plugins.builtins.operations import fake_embedding, fixed_char_chunks, parse_pdf
 from strata.plugins.protocols import AdapterMetadata
 from strata.plugins.registry import register_operation
+from strata.state.connection import bootstrap, connect_state
+from strata.state.schema import vector_sink
 
 
 class MarkdownNoopOperation:
@@ -95,7 +102,15 @@ class FakeEmbeddingOperation:
                     data=vector,
                     parent_input_ids=[upstream.input_id],
                     content_hash=hash_canonical(vector),
-                    metadata={"upstream_instance_key": upstream.instance_key},
+                    metadata={
+                        "upstream_instance_key": upstream.instance_key,
+                        "chunk_instance_key": upstream.instance_key,
+                        "chunk_text": str(upstream.data),
+                        "source_item_key": (
+                            upstream.metadata.get("source_item_key")
+                            or _source_key(upstream.instance_key)
+                        ),
+                    },
                 )
             )
         return outputs
@@ -105,45 +120,47 @@ class LocalSqliteVectorSinkOperation:
     def run(
         self, inputs: list[OperationInput], config: dict[str, Any]
     ) -> list[OperationOutput]:
-        by_role = {input_item.role: input_item for input_item in inputs}
-        chunk = by_role.get("chunk")
-        embedding = by_role.get("embedding")
-        if chunk is None or embedding is None:
-            roles = ", ".join(sorted(by_role))
-            raise ValueError(
-                "local_sqlite_vector_sink requires chunk and embedding inputs, "
-                f"got: {roles}"
+        outputs: list[OperationOutput] = []
+        rows: list[dict[str, Any]] = []
+        for embedding in inputs:
+            vector = cast(list[float], embedding.data)
+            chunk_instance_key = str(
+                embedding.metadata.get("chunk_instance_key") or embedding.instance_key
             )
-        vector = cast(list[float], embedding.data)
-        source_item_key = str(
-            chunk.metadata.get("source_item_key") or _source_key(chunk.instance_key)
-        )
-        output_hash = hash_canonical(
-            {
-                "chunk": chunk.instance_key,
-                "embedding": vector,
-                "source": source_item_key,
-            }
-        )
-        return [
-            OperationOutput(
-                instance_key=chunk.instance_key,
-                output_location=f"sqlite://local_vector_sink/{chunk.instance_key}",
-                output_hash=output_hash,
-                data={
-                    "instance_key": chunk.instance_key,
+            source_item_key = str(
+                embedding.metadata.get("source_item_key") or _source_key(chunk_instance_key)
+            )
+            chunk_text = str(embedding.metadata.get("chunk_text") or "")
+            output_hash = hash_canonical(
+                {
+                    "chunk": chunk_instance_key,
+                    "embedding": vector,
+                    "source": source_item_key,
+                }
+            )
+            outputs.append(
+                OperationOutput(
+                    instance_key=chunk_instance_key,
+                    output_location=f"sqlite://local_vector_sink/{chunk_instance_key}",
+                    output_hash=output_hash,
+                    parent_input_ids=[embedding.input_id],
+                    metadata={
+                        "source_item_key": source_item_key,
+                        "chunk_instance_key": chunk_instance_key,
+                    },
+                )
+            )
+            rows.append(
+                {
+                    "instance_key": chunk_instance_key,
                     "embedding_fingerprint": embedding.input_fingerprint or "",
                     "source_item_key": source_item_key,
-                    "chunk_text": str(chunk.data),
+                    "chunk_text": chunk_text,
                     "embedding": vector,
-                },
-                parent_input_ids=[chunk.input_id, embedding.input_id],
-                metadata={
-                    "source_item_key": source_item_key,
-                    "chunk_instance_key": chunk.instance_key,
-                },
+                }
             )
-        ]
+        _write_local_vector_rows(config, rows)
+        return outputs
 
 
 def _one_input(inputs: list[OperationInput]) -> OperationInput:
@@ -154,6 +171,59 @@ def _one_input(inputs: list[OperationInput]) -> OperationInput:
 
 def _source_key(instance_key: str) -> str:
     return instance_key.split("#", 1)[0]
+
+
+def _write_local_vector_rows(config: dict[str, Any], rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    runtime = config.get("_strata")
+    if not isinstance(runtime, dict):
+        raise ValueError("local_sqlite_vector_sink requires Strata runtime context")
+    state_url = str(runtime["state_url"])
+    project_root = Path(str(runtime["project_root"]))
+    project_id = str(runtime["project_id"])
+    tenant_id = str(runtime["tenant_id"])
+    engine = connect_state(_state_path_from_url(state_url, project_root))
+    bootstrap(engine)
+    with engine.begin() as conn:
+        for row in rows:
+            values = {
+                "project_id": project_id,
+                "tenant_id": tenant_id,
+                "instance_key": row["instance_key"],
+                "embedding_fingerprint": row["embedding_fingerprint"],
+                "source_item_key": row["source_item_key"],
+                "chunk_text": row["chunk_text"],
+                "embedding_json": json.dumps(row["embedding"]),
+                "updated_at": datetime.now(UTC),
+            }
+            stmt = sqlite_insert(vector_sink).values(values)
+            conn.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=[
+                        vector_sink.c.project_id,
+                        vector_sink.c.tenant_id,
+                        vector_sink.c.instance_key,
+                        vector_sink.c.embedding_fingerprint,
+                    ],
+                    set_={
+                        "source_item_key": stmt.excluded.source_item_key,
+                        "chunk_text": stmt.excluded.chunk_text,
+                        "embedding_json": stmt.excluded.embedding_json,
+                        "updated_at": stmt.excluded.updated_at,
+                    },
+                )
+            )
+
+
+def _state_path_from_url(url: str, root: Path) -> Path:
+    if url.startswith("sqlite:///"):
+        raw_path = url.removeprefix("sqlite:///")
+        path = Path(raw_path)
+        if not path.is_absolute():
+            path = root / path
+        return path
+    raise ValueError(f"unsupported state url: {url}")
 
 
 def _metadata(

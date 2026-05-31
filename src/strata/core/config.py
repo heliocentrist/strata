@@ -50,6 +50,11 @@ def load_manifest(project_file: Path) -> Manifest:
     assets: dict[str, AssetSpec] = {}
     for name in asset_order:
         spec = dict(raw_pipeline[name] or {})
+        if "inputs" in spec or "join" in spec:
+            raise ValueError(
+                f"asset {name} uses removed multi-input join syntax; "
+                "model joins as an upstream operation and use a single input"
+            )
         version = spec.pop("version", None) or f"{name}@0.1.0"
         operation_name = _operation_ref(name, spec)
         adapter_metadata("operation", operation_name)
@@ -61,7 +66,6 @@ def load_manifest(project_file: Path) -> Manifest:
             version=version,
             **spec,
         )
-    _normalize_single_input_sink(assets)
     _validate_pipeline(assets, sources)
 
     state_url = raw.get("state", {}).get("url", "sqlite:///./.strata/state.db")
@@ -99,26 +103,11 @@ def _validate_pipeline(assets: dict[str, AssetSpec], sources: dict[str, SourceSp
             raise ValueError(f"asset {asset.name} references unknown source: {asset.source}")
         if asset.input and asset.input not in assets:
             raise ValueError(f"asset {asset.name} references unknown input asset: {asset.input}")
-        for role, input_asset in asset.inputs.items():
-            if input_asset not in assets:
-                raise ValueError(
-                    f"asset {asset.name} input role {role} references unknown asset: {input_asset}"
-                )
-        binding_count = sum(bool(value) for value in (asset.source, asset.input, asset.inputs))
+        binding_count = sum(bool(value) for value in (asset.source, asset.input))
         if binding_count != 1:
             raise ValueError(
-                f"asset {asset.name} must define exactly one of source, input, or inputs"
+                f"asset {asset.name} must define exactly one of source or input"
             )
-
-
-def _normalize_single_input_sink(assets: dict[str, AssetSpec]) -> None:
-    for asset in assets.values():
-        if asset.inputs or not asset.input or asset.kind != "sink":
-            continue
-        primary_asset = assets.get(asset.input)
-        if primary_asset is not None and primary_asset.input:
-            asset.inputs = {"chunk": primary_asset.input, "embedding": asset.input}
-            asset.input = None
 
 
 def _operation_ref(asset_name: str, spec: dict[str, Any]) -> str:
@@ -130,8 +119,6 @@ def _operation_ref(asset_name: str, spec: dict[str, Any]) -> str:
 def _default_asset_kind(asset_name: str, spec: dict[str, Any]) -> str:
     if spec.get("source"):
         return "parsed"
-    if spec.get("inputs"):
-        return "sink"
     return asset_name
 
 
@@ -151,8 +138,6 @@ def _topological_asset_order(raw_pipeline: dict[str, Any]) -> list[str]:
         spec = dict(raw_pipeline[name] or {})
         if spec.get("input"):
             visit(str(spec["input"]))
-        for input_asset in dict(spec.get("inputs") or {}).values():
-            visit(str(input_asset))
         visiting.remove(name)
         visited.add(name)
         ordered.append(name)

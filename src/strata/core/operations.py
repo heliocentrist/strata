@@ -19,6 +19,8 @@ class OperationInput:
     source_content_hash: str | None = None
     path: Path | None = None
     uri: str | None = None
+    artifact_location: str | None = None
+    partition_key: str | None = None
 
 
 @dataclass(frozen=True)

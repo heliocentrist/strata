@@ -66,9 +66,7 @@ pipeline:
   search:
     operation: local_sqlite_vector_sink
     version: sink@0.1.0
-    inputs:
-      chunk: segments
-      embedding: vectors
+    input: vectors
 """,
         encoding="utf-8",
     )
@@ -77,7 +75,7 @@ pipeline:
     assert manifest.assets["raw_text"].source == "docs"
     assert manifest.assets["segments"].input == "raw_text"
     assert manifest.assets["vectors"].input == "segments"
-    assert manifest.assets["search"].inputs == {"chunk": "segments", "embedding": "vectors"}
+    assert manifest.assets["search"].input == "vectors"
 
     engine = connect_state(state_path_from_url(manifest.state_url, manifest.root))
     bootstrap(engine)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 from strata.core.operations import OperationInput, OperationOutput
@@ -18,6 +19,23 @@ class OperationInvocation:
     config: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class OperationWindow:
+    window_id: str
+    asset_name: str
+    artifact_root: Path
+    artifact_collection: str
+    transform_version: str
+    config_hash: str
+    determinism: str
+    invocations: list[OperationInvocation]
+
+
+@dataclass(frozen=True)
+class OperationWindowResult:
+    output_groups: list[list[OperationOutput]]
+
+
 class OperationRunner(Protocol):
     async def run(self, invocation: OperationInvocation) -> list[OperationOutput]: ...
 
@@ -25,3 +43,5 @@ class OperationRunner(Protocol):
         self,
         invocations: list[OperationInvocation],
     ) -> list[list[OperationOutput]]: ...
+
+    async def run_window(self, window: OperationWindow) -> OperationWindowResult: ...

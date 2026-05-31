@@ -7,7 +7,7 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
-from strata.core.collections import ArtifactPayload, ArtifactWrite
+from strata.core.collections import ArtifactPayload
 from strata.core.hashing import config_hash, hash_canonical, input_fingerprint, sha256_text
 from strata.core.models import (
     AssetInstanceCommit,
@@ -20,9 +20,13 @@ from strata.core.models import (
     SourceSnapshot,
 )
 from strata.core.operations import OperationInput, OperationOutput
-from strata.execution.artifacts import read_artifact, write_many_artifacts, write_one_artifact
 from strata.executors.local import InlineOperationRunner
-from strata.executors.protocols import ApplyResult, OperationInvocation, OperationRunner
+from strata.executors.protocols import (
+    ApplyResult,
+    OperationInvocation,
+    OperationRunner,
+    OperationWindow,
+)
 from strata.state.repository import StateRepository
 
 logger = logging.getLogger(__name__)
@@ -281,13 +285,15 @@ async def _run_build_layer(
                 len(window),
                 sum(len(item.input_batch.inputs) for item in window),
             )
-            output_groups = await runner.run_many([item.invocation for item in window])
+            window_result = await runner.run_window(
+                _runner_window(manifest, asset, f"layer:{asset.name}", window)
+            )
             logger.debug(
                 "build window outputs run_id=%s asset=%s output_groups=%s outputs=%s",
                 run_id,
                 asset.name,
-                len(output_groups),
-                sum(len(outputs) for outputs in output_groups),
+                len(window_result.output_groups),
+                sum(len(outputs) for outputs in window_result.output_groups),
             )
             _commit_output_window(
                 manifest=manifest,
@@ -296,7 +302,7 @@ async def _run_build_layer(
                 asset=asset,
                 transform_id=transform_id,
                 window=window,
-                output_groups=output_groups,
+                output_groups=window_result.output_groups,
                 counts=counts,
             )
     except Exception as exc:
@@ -454,8 +460,6 @@ def _scope_artifacts(
 
 
 def _asset_dependencies(asset: AssetSpec) -> list[str]:
-    if asset.inputs:
-        return list(dict(sorted(asset.inputs.items())).values())
     if asset.input:
         return [asset.input]
     return []
@@ -504,8 +508,18 @@ def _transform_id(manifest: Manifest, repo: StateRepository, asset_name: str, cf
     )
 
 
-def _plugin_config(asset: AssetSpec) -> dict[str, Any]:
-    return dict(asset.config)
+def _plugin_config(manifest: Manifest, asset: AssetSpec) -> dict[str, Any]:
+    config = dict(asset.config)
+    config.setdefault(
+        "_strata",
+        {
+            "state_url": manifest.state_url,
+            "project_root": str(manifest.root),
+            "project_id": manifest.context.project_id,
+            "tenant_id": manifest.context.tenant_id,
+        },
+    )
+    return config
 
 
 def _source_operation_input(source_name: str, item: SourceItem) -> OperationInput:
@@ -520,23 +534,25 @@ def _source_operation_input(source_name: str, item: SourceItem) -> OperationInpu
         source_content_hash=item.content_hash,
         path=item.path,
         uri=item.uri,
+        partition_key=item.content_hash,
     )
 
 
 def _artifact_operation_input(
     role: str,
     artifact: MaterializedArtifact,
-    payload: dict[str, Any],
+    partition_key: str | None,
 ) -> OperationInput:
     return OperationInput(
         role=role,
         asset_name=artifact.asset_name,
         instance_key=artifact.instance_key,
         input_id=f"artifact:{artifact.id}",
-        data=payload.get("data"),
-        metadata={**artifact.metadata, **dict(payload.get("metadata") or {})},
+        metadata=artifact.metadata,
         input_fingerprint=artifact.input_fingerprint,
         content_hash=artifact.content_hash,
+        artifact_location=artifact.output_location,
+        partition_key=partition_key or artifact.input_fingerprint,
     )
 
 
@@ -582,7 +598,9 @@ async def _execute_flatmap_operation(
         asset=asset,
         groups=groups,
     ):
-        output_groups = await runner.run_many([item.invocation for item in window])
+        window_result = await runner.run_window(
+            _runner_window(manifest, asset, operation.op_id, window)
+        )
         _commit_output_window(
             manifest=manifest,
             repo=repo,
@@ -590,7 +608,7 @@ async def _execute_flatmap_operation(
             asset=asset,
             transform_id=transform_id,
             window=window,
-            output_groups=output_groups,
+            output_groups=window_result.output_groups,
             counts=counts,
         )
 
@@ -612,7 +630,7 @@ def _invocation_windows(
                     invocation_id=f"{operation_id}:{index}",
                     operation_name=asset.operation_name,
                     inputs=input_batch.inputs,
-                    config=_plugin_config(asset),
+                    config=_plugin_config(manifest, asset),
                 ),
                 input_batch=input_batch,
             )
@@ -630,6 +648,24 @@ def _window_size(manifest: Manifest, asset: AssetSpec) -> int:
         manifest.execution.config.get("window_size", 1000),
     )
     return max(1, int(value))
+
+
+def _runner_window(
+    manifest: Manifest,
+    asset: AssetSpec,
+    window_id: str,
+    window: list[_InvocationWindowItem],
+) -> OperationWindow:
+    return OperationWindow(
+        window_id=window_id,
+        asset_name=asset.name,
+        artifact_root=manifest.artifacts_path,
+        artifact_collection=str(asset.artifact_strategy.get("type") or "local_json"),
+        transform_version=asset.version,
+        config_hash=config_hash(asset.config),
+        determinism=asset.determinism.value,
+        invocations=[item.invocation for item in window],
+    )
 
 
 def _commit_output_window(
@@ -672,14 +708,10 @@ def _commit_output_window(
         )
         _update_source_state_for_groups(repo, [output.group for output in external_outputs])
     if artifact_outputs:
-        _commit_artifact_outputs_by_partition(
-            manifest=manifest,
-            repo=repo,
-            asset=asset,
-            transform_id=transform_id,
-            outputs=artifact_outputs,
+        raise ValueError(
+            f"runner returned {len(artifact_outputs)} unwritten artifact output(s) "
+            f"for asset {asset.name}; runners must write payloads and return locations"
         )
-        _update_source_state_for_groups(repo, [output.group for output in artifact_outputs])
 
 
 def _input_batches(
@@ -781,17 +813,13 @@ def _build_input_groups_for_item(
         for upstream in upstreams:
             yield _artifact_group(
                 manifest=manifest,
-                role="input",
                 artifact=upstream,
                 item_key=item_key,
                 operation_run_id=operation_run_id,
                 partition_key=partition_key,
             )
         return
-    if asset.inputs:
-        yield from _build_join_groups(manifest, repo, asset, item_key, operation_run_id)
-        return
-    raise ValueError(f"asset {asset.name} must define source, input, or inputs")
+    raise ValueError(f"asset {asset.name} must define source or input")
 
 
 def _operation_item_keys(operation: Operation) -> list[str]:
@@ -816,81 +844,20 @@ def _operation_scope(operation: Operation) -> str:
 def _artifact_group(
     *,
     manifest: Manifest,
-    role: str,
     artifact: MaterializedArtifact,
     item_key: str,
     operation_run_id: str,
     partition_key: str | None,
 ) -> _InputGroup:
-    payload = read_artifact(manifest, artifact.output_location)
+    _ = manifest
     return _InputGroup(
         item_key=item_key,
         default_instance_key=artifact.instance_key,
-        inputs=[_artifact_operation_input(role, artifact, payload)],
+        inputs=[_artifact_operation_input("input", artifact, partition_key)],
         upstreams=[artifact],
         operation_run_id=operation_run_id,
         partition_key=partition_key,
     )
-
-
-def _build_join_groups(
-    manifest: Manifest,
-    repo: StateRepository,
-    asset: AssetSpec,
-    item_key: str,
-    operation_run_id: str,
-) -> list[_InputGroup]:
-    primary_role = str(asset.join.get("primary") or next(iter(asset.inputs)))
-    if primary_role not in asset.inputs:
-        raise ValueError(
-            f"asset {asset.name} join.primary must reference one of its inputs"
-        )
-    primary_asset_name = asset.inputs[primary_role]
-    primary_artifacts = _scope_artifacts(manifest, repo, primary_asset_name, item_key)
-    if not primary_artifacts:
-        raise ValueError(f"missing {primary_asset_name} artifacts for {item_key}")
-
-    groups: list[_InputGroup] = []
-    for primary in primary_artifacts:
-        role_artifacts: dict[str, MaterializedArtifact] = {primary_role: primary}
-        for role, input_asset_name in asset.inputs.items():
-            if role == primary_role:
-                continue
-            artifact = next(iter(repo.upstream_artifacts(primary.id, input_asset_name)), None)
-            if artifact is None:
-                artifact = repo.latest_materialized(input_asset_name, primary.instance_key)
-            if artifact is None:
-                raise ValueError(
-                    f"missing {input_asset_name} artifact for {primary.instance_key}"
-                )
-            role_artifacts[role] = artifact
-
-        inputs = [
-            _artifact_operation_input(
-                role,
-                artifact,
-                read_artifact(manifest, artifact.output_location),
-            )
-            for role, artifact in sorted(role_artifacts.items())
-        ]
-        upstreams = [artifact for _role, artifact in sorted(role_artifacts.items())]
-        groups.append(
-            _InputGroup(
-                item_key=item_key,
-                default_instance_key=primary.instance_key,
-                inputs=inputs,
-                upstreams=upstreams,
-                operation_run_id=operation_run_id,
-                partition_key=_partition_key_for_scope(
-                    manifest,
-                    repo,
-                    asset,
-                    item_key,
-                    upstreams,
-                ),
-            )
-        )
-    return groups
 
 
 def _commit_output_batch(
@@ -1027,180 +994,50 @@ def _commit_external_outputs(
 ) -> None:
     if not outputs:
         return
-    vector_rows = [
-        _vector_sink_row(output)
-        for output in outputs
-        if str(output.output_location).startswith("sqlite://local_vector_sink/")
-    ]
     logger.debug(
-        "commit external asset=%s outputs=%s vector_rows=%s",
+        "commit external asset=%s outputs=%s",
         asset.name,
         len(outputs),
-        len(vector_rows),
     )
-    repo.upsert_vectors(vector_rows)
-    repo.commit_asset_instances(
-        [
-            AssetInstanceCommit(
-                asset_name=asset.name,
-                instance_key=output.instance_key,
-                input_fingerprint=output.input_fingerprint,
-                output_location=output.output_location,
-                output_hash=output.output_hash,
-                content_hash=output.content_hash,
-                transform_id=transform_id,
-                materialization_strategy=asset.materialization_strategy,
-                metadata=output.metadata,
-                upstream_id=output.group.upstreams[0].id,
-                additional_upstream_ids=[
-                    upstream.id for upstream in output.group.upstreams[1:]
-                ],
-                operation_item_id=output.op_item_id,
-                operation_status=OperationItemStatus.SUCCEEDED,
-            )
-            for output in outputs
-        ]
-    )
-
-
-def _vector_sink_row(output: _PendingExternalOutput) -> dict[str, Any]:
-    if not isinstance(output.data, dict):
-        raise ValueError("local vector sink output must carry vector row data")
-    return {
-        "instance_key": output.data["instance_key"],
-        "embedding_fingerprint": output.data["embedding_fingerprint"],
-        "source_item_key": output.data["source_item_key"],
-        "chunk_text": output.data["chunk_text"],
-        "embedding": output.data["embedding"],
-    }
-
-
-def _commit_artifact_outputs_by_partition(
-    *,
-    manifest: Manifest,
-    repo: StateRepository,
-    asset: AssetSpec,
-    transform_id: str,
-    outputs: list[_PendingArtifactOutput],
-) -> None:
     source_outputs = [output for output in outputs if not output.group.upstreams]
-    if source_outputs:
-        logger.debug(
-            "commit source artifacts asset=%s outputs=%s",
-            asset.name,
-            len(source_outputs),
-        )
-        _commit_artifact_outputs(
-            manifest=manifest,
-            repo=repo,
-            asset=asset,
+    for output in source_outputs:
+        repo.write_asset_instance(
+            asset_name=asset.name,
+            instance_key=output.instance_key,
+            input_fingerprint_value=output.input_fingerprint,
+            output_location=output.output_location,
+            output_hash=output.output_hash,
+            content_hash=output.content_hash,
             transform_id=transform_id,
-            outputs=source_outputs,
+            materialization_strategy=asset.materialization_strategy,
+            metadata_value=output.metadata,
         )
+        repo.update_operation_item(output.op_item_id, "succeeded")
 
-    outputs_by_partition: dict[str, list[_PendingArtifactOutput]] = {}
-    for output in outputs:
-        if not output.group.upstreams:
-            continue
-        outputs_by_partition.setdefault(
-            _artifact_output_partition_key(output),
-            [],
-        ).append(output)
-
-    for partition_outputs in outputs_by_partition.values():
-        logger.debug(
-            "commit partition artifacts asset=%s partition=%s outputs=%s",
-            asset.name,
-            _artifact_output_partition_key(partition_outputs[0]),
-            len(partition_outputs),
-        )
-        _commit_artifact_outputs(
-            manifest=manifest,
-            repo=repo,
-            asset=asset,
-            transform_id=transform_id,
-            outputs=partition_outputs,
-        )
-
-
-def _artifact_output_partition_key(output: _PendingArtifactOutput) -> str:
-    return output.group.partition_key or output.group.upstreams[0].input_fingerprint
-
-
-def _commit_artifact_outputs(
-    *,
-    manifest: Manifest,
-    repo: StateRepository,
-    asset: AssetSpec,
-    transform_id: str,
-    outputs: list[_PendingArtifactOutput],
-) -> None:
-    if all(not output.group.upstreams for output in outputs):
-        for output in outputs:
-            write_result = write_one_artifact(
-                manifest=manifest,
-                asset_name=asset.name,
-                item=ArtifactWrite(
+    upstream_outputs = [output for output in outputs if output.group.upstreams]
+    if upstream_outputs:
+        repo.commit_asset_instances(
+            [
+                AssetInstanceCommit(
+                    asset_name=asset.name,
                     instance_key=output.instance_key,
                     input_fingerprint=output.input_fingerprint,
+                    output_location=output.output_location,
+                    output_hash=output.output_hash,
                     content_hash=output.content_hash,
-                    payload=output.payload,
-                ),
-            )
-            repo.write_asset_instance(
-                asset_name=asset.name,
-                instance_key=output.instance_key,
-                input_fingerprint_value=output.input_fingerprint,
-                output_location=write_result.output_ref,
-                output_hash=write_result.output_hash,
-                content_hash=output.content_hash,
-                transform_id=transform_id,
-                materialization_strategy=asset.materialization_strategy,
-                metadata_value=output.metadata,
-            )
-            repo.update_operation_item(output.op_item_id, "succeeded")
-        return
-
-    partition_key = (
-        outputs[0].group.partition_key
-        or outputs[0].group.upstreams[0].input_fingerprint
-    )
-    write_results = write_many_artifacts(
-        manifest=manifest,
-        asset_name=asset.name,
-        partition_key=partition_key,
-        items=[
-            ArtifactWrite(
-                instance_key=output.instance_key,
-                input_fingerprint=output.input_fingerprint,
-                content_hash=output.content_hash,
-                payload=output.payload,
-            )
-            for output in outputs
-        ],
-    )
-    repo.commit_asset_instances(
-        [
-            AssetInstanceCommit(
-                asset_name=asset.name,
-                instance_key=output.instance_key,
-                input_fingerprint=output.input_fingerprint,
-                output_location=write_results[index].output_ref,
-                output_hash=write_results[index].output_hash,
-                content_hash=output.content_hash,
-                transform_id=transform_id,
-                materialization_strategy=asset.materialization_strategy,
-                metadata=output.metadata,
-                upstream_id=output.group.upstreams[0].id,
-                additional_upstream_ids=[
-                    upstream.id for upstream in output.group.upstreams[1:]
-                ],
-                operation_item_id=output.op_item_id,
-                operation_status=OperationItemStatus.SUCCEEDED,
-            )
-            for index, output in enumerate(outputs)
-        ]
-    )
+                    transform_id=transform_id,
+                    materialization_strategy=asset.materialization_strategy,
+                    metadata=output.metadata,
+                    upstream_id=output.group.upstreams[0].id,
+                    additional_upstream_ids=[
+                        upstream.id for upstream in output.group.upstreams[1:]
+                    ],
+                    operation_item_id=output.op_item_id,
+                    operation_status=OperationItemStatus.SUCCEEDED,
+                )
+                for output in upstream_outputs
+            ]
+        )
 
 
 def _output_fingerprint(asset: AssetSpec, group: _InputGroup, instance_key: str) -> str:

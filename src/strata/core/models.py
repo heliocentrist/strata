@@ -44,8 +44,6 @@ class AssetSpec(BaseModel):
     operation_name: str
     source: str | None = None
     input: str | None = None
-    inputs: dict[str, str] = Field(default_factory=dict)
-    join: dict[str, Any] = Field(default_factory=dict)
     version: str
     config: dict[str, Any] = Field(default_factory=dict)
     execution: dict[str, Any] = Field(default_factory=dict)
@@ -155,43 +153,3 @@ class AssetInstanceCommit(BaseModel):
     additional_upstream_ids: list[str] = Field(default_factory=list)
     operation_item_id: str
     operation_status: OperationItemStatus
-
-
-class SourceRef(BaseModel):
-    name: str | None = None
-    item_key: str
-    content_hash: str | None = None
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-
-class ChunkRef(BaseModel):
-    asset_name: str = "chunks"
-    instance_key: str
-    fingerprint: str
-    content_hash: str | None = None
-    text: str
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-
-class EmbeddingRef(BaseModel):
-    asset_name: str = "embeddings"
-    instance_key: str
-    fingerprint: str
-    content_hash: str | None = None
-    vector: list[float]
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-
-class HybridChunkEmbeddingItem(BaseModel):
-    context: ExecutionContext
-    source: SourceRef
-    chunk: ChunkRef
-    embedding: EmbeddingRef
-    document_id: str
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-
-class SinkWriteResult(BaseModel):
-    output_location: str
-    output_hash: str | None = None
-    external_id: str | None = None

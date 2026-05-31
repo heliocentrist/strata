@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from strata.core.collections import (
@@ -53,9 +54,13 @@ def _collection_for_asset(manifest: Manifest, asset_name: str) -> ArtifactCollec
 
 
 def read_artifact(manifest: Manifest, location: str | None) -> dict[str, Any]:
+    return read_artifact_ref(manifest.artifacts_path, location)
+
+
+def read_artifact_ref(root_path: Path, location: str | None) -> dict[str, Any]:
     if not location:
         raise ValueError("artifact has no output location")
-    return get_artifact_collection("local_json").read(manifest.artifacts_path, location)
+    return get_artifact_collection("local_json").read(root_path, location)
 
 
 def artifact_source(payload: dict[str, Any]) -> dict[str, Any]:

@@ -329,7 +329,7 @@ The planning layer is pure and sits between compilation and execution. It receiv
 
 This is what allows: exhaustive unit testing of planning logic with no infrastructure; swapping executors without touching planning; and eventual extraction of Strata from any host system.
 
-For transforms whose exact outputs are not knowable before execution, the planner emits coarse operations such as "build chunks for parsed/docA". It does not run the operation plugin to discover exact output instances. During `apply`, the runtime binds input groups from `source`, `input`, or named `inputs`, invokes the plugin through the selected operation runner, flatmaps returned outputs into exact asset instances, and records lineage.
+For transforms whose exact outputs are not knowable before execution, the planner emits coarse operations such as "build chunks for parsed/docA". It does not run the operation plugin to discover exact output instances. During `apply`, the runtime binds input groups from `source` or a single upstream `input`, invokes the plugin through the selected operation runner, flatmaps returned outputs into exact asset instances, and records lineage.
 
 Important boundary correction: Strata's apply semantics are not pluggable executor behavior. The runtime always owns dependency layers, input binding, cache checks, fingerprinting, artifact writes, state commits, lineage, operation item progress, source state, checkpoints, and delete semantics. The pluggable boundary is the async `OperationRunner`, which decides where bounded windows of `OperationPlugin.run(...)` invocations execute: inline, in a local thread pool, or later as Temporal/Dagster activities.
 
@@ -348,6 +348,10 @@ class OperationPlugin(Protocol):
 An operation may validly return an empty output list. This is treated as a successful no-output execution, not as a failed operation. Phase 0 does not write cache markers for empty output groups, so such work may be repeated by future plans. That is acceptable for the prototype; an explicit empty-output marker can be added later if repeated filters become expensive.
 
 Assets may opt into larger plugin calls with `execution.inputs_per_call`. The minimum is `1`. This lets an embedding operation receive many chunk inputs in one sync plugin call while the runtime still commits each returned embedding as its own asset instance. Separately, `execution.window_size` controls how many invocation batches the runtime hands to the async runner before waiting and committing results. Windows are formed across the whole asset dependency layer, not only within a single source-scoped planned operation, so small inputs from many source items can still fill efficient runner windows. Artifact outputs returned by a window are grouped by partition before writing, so the local artifact collection writes one payload/manifest pair per window/partition instead of one pair per output item. Runners may do their own lower-level batching, concurrency, and activity scheduling inside each window.
+
+The intended runner IO contract is location-based for all runners, not Temporal-specific. The runtime builds partition-aligned windows and passes artifact locations or manifest pointers to the runner rather than large payloads. A runner reads whole input files for the partitions assigned to that window, runs operation plugins, writes immutable output payload files and data manifests for the window/partition, and returns output descriptors: manifest URI, item URI, record ranges/counts, hashes, logical output ids, and per-item status. The Strata runtime is the control plane: it does not need data-plane object store access during normal apply. It trusts runner-reported descriptors, commits `asset_instances` and lineage in the DB, updates operation progress, and stamps the window as done. Data manifests and payload files are therefore written artifacts, not commits; a crash after runner writes but before runtime DB commit leaves orphan files for `doctor` to report or clean. `doctor` is allowed to be a special case that has object-store access for deep repair/verification.
+
+Layer fusing is a future optimization, not part of the current contract. Today the runtime executes one asset layer at a time and commits between layers. Later, compatible adjacent layers may be fused into one runner window to reduce storage IO, but this must preserve the same external cache, lineage, manifest, and retry semantics.
 
 Pipeline YAML is therefore operation-centric:
 
@@ -371,9 +375,7 @@ pipeline:
       window_size: 1000
 
   sink:
-    inputs:
-      chunk: chunks
-      embedding: embeddings
+    input: embeddings
     operation: local_sqlite_vector_sink
 ```
 
@@ -696,41 +698,33 @@ Manifests are commit markers for bundled writes: payload files are written first
 
 **Current implementation:** artifact collection protocols and registry are implemented. `local_json` is registered as the built-in collection. Single-output assets currently use one JSON file per instance; fanout assets use one JSONL payload plus an immutable timestamped manifest per parent/partition. The database stores the collection-returned address and hashes. More compact strategies for high-volume single-output assets, such as JSONL or Parquet bundles, remain deferred.
 
-#### 6.9.5 Multi-input operation contracts
+#### 6.9.5 Enriched single-input sink contracts
 
-Hybrid search indexes usually need one physical document per chunk containing both lexical text and vector embedding. Model this as one logical sink asset with named inputs:
+Hybrid search indexes usually need one physical document per chunk containing both lexical text and vector embedding. Model this as a linear pipeline: the embedding/enrichment operation carries chunk text and source metadata forward, then the sink consumes that enriched asset as its single input.
 
 ```yaml
+embedded_chunks:
+  input: chunks
+  operation: openai_embedding
+  version: openai_embedding@0.1.0
+  execution:
+    inputs_per_call: 128
+
 search_index:
   operation: elasticsearch_hybrid_sink
   version: elasticsearch_hybrid_sink@0.1.0
-  inputs:
-    chunk: chunks
-    embedding: embeddings
-  join:
-    type: lineage
-    primary: embedding
-    upstream: chunk
+  input: embedded_chunks
   config:
     index: search_chunks
 ```
 
 The operation should not crawl Strata internals. Instead:
 
-- The pipeline declares named inputs.
-- The executor resolves that contract from the DAG and lineage.
-- The executor reads chunk and embedding artifacts and passes them as role-tagged `OperationInput` values.
-- The operation writes the physical index document and returns an `OperationOutput` with output location/hash.
-- Strata records lineage edges from both chunk and embedding instances to the sink instance.
-
-Conceptual inputs passed to the sink:
-
-```python
-[
-    OperationInput(role="chunk", asset_name="chunks", data="...", input_fingerprint="..."),
-    OperationInput(role="embedding", asset_name="embeddings", data=[...], input_fingerprint="..."),
-]
-```
+- The embedding/enrichment operation receives chunks and returns enriched records with vector, text, source metadata, and stable parent lineage.
+- The sink receives enriched records through the normal single-input contract.
+- The sink writes physical index documents and returns `OperationOutput` values with output location/hash.
+- Strata records ordinary lineage edges from chunk to enriched record to sink result.
+- If a future use case truly needs joining independent assets, model that join as an explicit upstream operation that produces one enriched output collection.
 
 Delete behavior should be part of the sink contract:
 
@@ -740,7 +734,7 @@ sink.delete_source(context, source_name, source_item_key, config)
 
 For search indexes this may be a delete-by-query or a deletion of tracked document IDs. Host access records remain outside Strata.
 
-#### 6.9.5 Library-first execution API
+#### 6.9.6 Library-first execution API
 
 The host should call Strata as regular code inside its existing execution environment first. Executor adapters are later.
 
@@ -769,7 +763,7 @@ result = strata.apply_staged_manifest(
 
 The host scheduler can run this in one activity/job initially. Strata remains responsible for idempotency, cache checks, operation item progress, lineage, and partial item failures. A later Temporal/Dagster executor can map Strata operations to native activities when needed.
 
-#### 6.9.6 Project registry and CLI access to host-created projects
+#### 6.9.7 Project registry and CLI access to host-created projects
 
 Projects created by a host service may not have a local `strata.yml`. Operators still need to inspect them with the CLI and docs tools.
 
@@ -803,7 +797,7 @@ strata inspect --state-url postgresql://... --project-id project_123 --tenant-id
 
 The existing `-p strata.yml` path remains for local projects. The new state/project-id path is for projects created and processed by a host application.
 
-#### 6.9.7 Milestones for host-staged ingest
+#### 6.9.8 Milestones for host-staged ingest
 
 **Milestone A — Source/object foundations**
 
@@ -836,13 +830,13 @@ The existing `-p strata.yml` path remains for local projects. The new state/proj
 
 **Milestone D — Hybrid sink contract**
 
-- Add `AssetSpec.inputs` for named inputs.
-- Add sink input contract types.
-- Implement executor-side lineage join for chunk + embedding.
-- Update local sink or add a fake hybrid search sink test double.
-- Record sink lineage from both chunk and embedding.
+- Keep assets single-input only: every asset defines either `source` or `input`.
+- Carry chunk text/source metadata forward in the embedding/enrichment output.
+- Update local sink or add a fake hybrid search sink test double that consumes enriched records.
+- Record normal lineage from chunk to enriched record to sink result.
+- Reject removed named-input/join YAML with a clear compile-time error.
 
-**Current implementation:** named operation inputs, executor-side lineage join, role-tagged `OperationInput` values, generic `OperationOutput` results, and sink lineage from both chunk and embedding are implemented.
+**Current implementation:** named operation inputs and executor-side joins have been removed. The built-in embedding operation preserves chunk context in its output metadata, and the local SQLite vector sink consumes enriched embedding records as a normal single-input sink.
 
 **Milestone E — Search index sink**
 
@@ -864,7 +858,7 @@ The existing `-p strata.yml` path remains for local projects. The new state/proj
 - Add activity heartbeats/cancellation checks around Strata progress if needed.
 - Only after this is proven, add Temporal/Dagster operation runners that map plugin invocations onto native activities while the Strata runtime keeps cache, lineage, artifact commit, and progress semantics.
 
-#### 6.9.8 Test host fixture
+#### 6.9.9 Test host fixture
 
 Before integrating with a real host service, build a small test host app fixture that mimics the intended boundary:
 
@@ -1004,14 +998,14 @@ Each phase ships standalone value. Stopping after any phase is a coherent outcom
 
 Phase 1B local plugin registry is implemented around a generic operation interface. The runtime dispatches every executable asset through the named `operation` registry. Built-in operation plugins are registered for `markdown_noop`, `liteparse` (`auto` currently aliases `liteparse`), `fixed_token_chunker`, `fake_embedding`, and `local_sqlite_vector_sink`. `markdown_noop` accepts only `.md` files. `liteparse` reads `.txt` and `.md` directly and parses `.pdf` through LiteParse.
 
-The planner no longer hardcodes the canonical `parsed -> chunks -> embeddings -> sink` asset names. Asset ordering is compiled from the declared DAG, and the planner emits generic `build_scope` / `delete_scope` operations from asset dependencies and current state. Runtime input binding is inferred from the asset declaration shape: `source`, `input`, or named `inputs`. Plugin metadata no longer declares map/fanout/sink shape; every operation is executed through the same flatmap-style `OperationInput` / `OperationOutput` contract. Per-asset `execution.inputs_per_call` lets the runtime pass multiple compatible inputs into one plugin call; outputs use `parent_input_ids` to preserve exact lineage.
+The planner no longer hardcodes the canonical `parsed -> chunks -> embeddings -> sink` asset names. Asset ordering is compiled from the declared DAG, and the planner emits generic `build_scope` / `delete_scope` operations from asset dependencies and current state. Runtime input binding is inferred from the asset declaration shape: `source` or a single upstream `input`. Plugin metadata no longer declares map/fanout/sink shape; every operation is executed through the same flatmap-style `OperationInput` / `OperationOutput` contract. Per-asset `execution.inputs_per_call` lets the runtime pass multiple compatible inputs into one plugin call; outputs use `parent_input_ids` to preserve exact lineage.
 
 Pluggable operation-runner selection is implemented. `ExecutionSpec` is part of the manifest, `strata.yml` supports an `execution:` block, and the CLI/API dispatch through an operation-runner registry. Built-ins:
 
 - `local_single_thread` runs plugin invocations inline.
 - `local_threaded` uses a `ThreadPoolExecutor` and `max_workers` from execution config for safely batched plugin invocations.
 
-The runtime still owns apply semantics for both runners: dependency layers, input binding, layer-level runtime windows, cache checks, fingerprints, artifact writes, lineage, operation item status, source state, checkpoints, and delete behavior. The runner only executes bounded windows of `OperationPlugin.run(...)` calls. The current threaded runner parallelizes safely batched plugin invocations within those windows; dependency ordering, output materialization, and commit semantics remain runtime concerns.
+The runtime still owns apply semantics for both runners: dependency layers, input binding, layer-level runtime windows, cache checks, fingerprints, DB lineage, operation item status, source state, checkpoints, and delete behavior. The runner executes bounded, partition-aligned windows. Runners receive artifact locations/manifest pointers, read whole input files for their assigned partitions, write immutable output payload/data-manifest files, and return descriptors; the runtime commits those descriptors into state. The current local runners implement this boundary in-process, and the local SQLite sink operation owns its external sink write.
 
 ### Phase 2 — Ergonomics and trust
 
@@ -1043,7 +1037,10 @@ Richer test plugins and stronger compatibility enforcement remain deferred.
 **Goal:** Fit into how teams already run things.
 
 - Operation runner adapters: Temporal (durability/retries/scheduling), Dagster (`dagster-strata`), Prefect.
-- Temporal runner should map plugin invocations onto native workflow/activity boundaries while the Strata runtime preserves fingerprints, lineage, artifact commits, and retryable item state.
+- Temporal runner should map partition-aligned runtime windows onto native workflow/activity boundaries while the Strata runtime preserves fingerprints, lineage, artifact commits, and retryable item state.
+- Generalize the current local window contract to remote runners: runner inputs are artifact file/manifest pointers, runner outputs are immutable data-manifest descriptors, and the runtime writes only control-plane DB commits during normal apply.
+- Keep windows partition-aligned so separate runner activities do not share input files in the common case.
+- Defer layer fusing until the single-layer window contract is stable; fused layers may later reduce storage IO but must keep externally visible cache, lineage, manifest, and retry semantics.
 - Threaded local execution can later be refined once manifest assembly and partial fanout retry semantics are explicit.
 - Sink operations should support batched writes. The current local sink commits one external output at a time, which is acceptable for the fixture but wrong for Elasticsearch/OpenSearch/vector DB adapters. The sink contract should let a window produce many sink writes and commit them with bulk insert/upsert/delete APIs while still recording one `asset_instance` and lineage set per logical sink output.
 - Artifact store abstraction (local fs + S3) so intermediate artifacts (parsed markdown, chunk parquet) are the source of truth and the vector store is a rebuildable downstream sink.

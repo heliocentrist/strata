@@ -12,7 +12,8 @@ from strata.core.config import load_manifest, state_path_from_url
 from strata.core.operations import OperationInput, OperationOutput
 from strata.core.planning import plan
 from strata.execution.apply import apply_operations
-from strata.executors.protocols import OperationInvocation
+from strata.executors.local import InlineOperationRunner
+from strata.executors.protocols import OperationInvocation, OperationWindow, OperationWindowResult
 from strata.executors.registry import get_operation_runner, registered_operation_runners
 from strata.plugins.protocols import AdapterMetadata
 from strata.plugins.registry import get_operation, register_operation
@@ -76,6 +77,7 @@ def test_apply_submits_runner_windows(tmp_path: Path) -> None:
         def __init__(self) -> None:
             self.window_sizes: list[int] = []
             self.windows: list[tuple[str, tuple[str, ...]]] = []
+            self.artifact_input_locations: list[str] = []
 
         async def run(
             self,
@@ -103,6 +105,27 @@ def test_apply_submits_runner_windows(tmp_path: Path) -> None:
                     )
                 )
             return [await self.run(invocation) for invocation in invocations]
+
+        async def run_window(self, window: OperationWindow) -> OperationWindowResult:
+            self.window_sizes.append(len(window.invocations))
+            if window.invocations:
+                self.windows.append(
+                    (
+                        window.invocations[0].operation_name,
+                        tuple(
+                            input_item.instance_key
+                            for invocation in window.invocations
+                            for input_item in invocation.inputs
+                        ),
+                    )
+                )
+                self.artifact_input_locations.extend(
+                    str(input_item.artifact_location)
+                    for invocation in window.invocations
+                    for input_item in invocation.inputs
+                    if input_item.artifact_location is not None
+                )
+            return await InlineOperationRunner().run_window(window)
 
     project = write_project(tmp_path, max_chars=1000)
     (tmp_path / "docs" / "b.md").write_text(
@@ -154,6 +177,11 @@ def test_apply_submits_runner_windows(tmp_path: Path) -> None:
         "fake_embedding",
         ("a.md#chunk:0000", "b.md#chunk:0000"),
     ) in runner.windows
+    assert runner.artifact_input_locations
+    assert all(runner.artifact_input_locations)
+    assert any(
+        location.startswith("artifact://") for location in runner.artifact_input_locations
+    )
 
 
 def test_window_artifact_outputs_share_partition_manifest(tmp_path: Path) -> None:
