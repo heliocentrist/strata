@@ -58,4 +58,5 @@ def test_host_app_incremental_delta_does_not_delete_absent_items(tmp_path: Path)
     host.write_project()
 
     operations = plan_project(project)
-    assert [operation.scope.item_key for operation in operations] == ["economy/a.md"] * 4
+    assert [operation.scope.item_key for operation in operations] == [None] * 4
+    assert [operation.scope.item_keys for operation in operations] == [["economy/a.md"]] * 4

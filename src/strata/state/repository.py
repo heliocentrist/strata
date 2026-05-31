@@ -786,43 +786,61 @@ class StateRepository:
         chunk_text: str,
         embedding: list[float],
     ) -> None:
+        self.upsert_vectors(
+            [
+                {
+                    "instance_key": instance_key,
+                    "embedding_fingerprint": embedding_fingerprint,
+                    "source_item_key": source_item_key,
+                    "chunk_text": chunk_text,
+                    "embedding": embedding,
+                }
+            ]
+        )
+
+    def upsert_vectors(self, items: list[dict[str, Any]]) -> None:
+        if not items:
+            return
         timestamp = now()
         with self.begin() as conn:
-            row = conn.execute(
-                select(vector_sink).where(
-                    vector_sink.c.project_id == self.context.project_id,
-                    vector_sink.c.tenant_id == self.context.tenant_id,
-                    vector_sink.c.instance_key == instance_key,
-                    vector_sink.c.embedding_fingerprint == embedding_fingerprint,
-                )
-            ).first()
-            values = {
-                "source_item_key": source_item_key,
-                "chunk_text": chunk_text,
-                "embedding_json": json.dumps(embedding),
-                "updated_at": timestamp,
-            }
-            if row:
-                conn.execute(
-                    update(vector_sink)
-                    .where(
+            for item in items:
+                row = conn.execute(
+                    select(vector_sink).where(
                         vector_sink.c.project_id == self.context.project_id,
                         vector_sink.c.tenant_id == self.context.tenant_id,
-                        vector_sink.c.instance_key == instance_key,
-                        vector_sink.c.embedding_fingerprint == embedding_fingerprint,
+                        vector_sink.c.instance_key == str(item["instance_key"]),
+                        vector_sink.c.embedding_fingerprint
+                        == str(item["embedding_fingerprint"]),
                     )
-                    .values(**values)
-                )
-            else:
-                conn.execute(
-                    insert(vector_sink).values(
-                        project_id=self.context.project_id,
-                        tenant_id=self.context.tenant_id,
-                        instance_key=instance_key,
-                        embedding_fingerprint=embedding_fingerprint,
-                        **values,
+                ).first()
+                values = {
+                    "source_item_key": str(item["source_item_key"]),
+                    "chunk_text": str(item["chunk_text"]),
+                    "embedding_json": json.dumps(item["embedding"]),
+                    "updated_at": timestamp,
+                }
+                if row:
+                    conn.execute(
+                        update(vector_sink)
+                        .where(
+                            vector_sink.c.project_id == self.context.project_id,
+                            vector_sink.c.tenant_id == self.context.tenant_id,
+                            vector_sink.c.instance_key == str(item["instance_key"]),
+                            vector_sink.c.embedding_fingerprint
+                            == str(item["embedding_fingerprint"]),
+                        )
+                        .values(**values)
                     )
-                )
+                else:
+                    conn.execute(
+                        insert(vector_sink).values(
+                            project_id=self.context.project_id,
+                            tenant_id=self.context.tenant_id,
+                            instance_key=str(item["instance_key"]),
+                            embedding_fingerprint=str(item["embedding_fingerprint"]),
+                            **values,
+                        )
+                    )
 
     def lineage(self, asset_name: str, instance_key: str) -> list[dict[str, Any]]:
         root = self.latest_materialized(asset_name, instance_key)

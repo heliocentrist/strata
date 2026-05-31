@@ -28,7 +28,9 @@ def plan(
     selection: str | None = None,
 ) -> list[Operation]:
     selected = parse_selection(manifest, selection)
-    operations: list[Operation] = []
+    build_groups: dict[tuple[str, str, str], list[str]] = {}
+    build_counts: dict[tuple[str, str, str], int | None] = {}
+    delete_operations: list[Operation] = []
     source_items = {
         (snapshot.source_name, item.item_key): item
         for snapshot in source_snapshots.values()
@@ -44,7 +46,7 @@ def plan(
             continue
         item = source_items[(source_name, item_key)]
         if item.deleted:
-            operations.extend(
+            delete_operations.extend(
                 _delete_operations_for_source(manifest, selected.assets, source_name, item_key)
             )
             continue
@@ -74,16 +76,10 @@ def plan(
             reason = root_reason or upstream_reason or ("" if current else _missing_reason(asset))
             reasons[asset_name] = reason
             if reason and asset_name in selected.assets:
-                operations.append(
-                    _operation(
-                        manifest,
-                        op_type="build_scope",
-                        asset_name=asset_name,
-                        item_key=item_key,
-                        source_name=source_name,
-                        reason=reason,
-                        count=1 if asset.source else None,
-                    )
+                key = (asset_name, source_name, reason)
+                build_groups.setdefault(key, []).append(item_key)
+                build_counts[key] = (
+                    (build_counts.get(key) or 0) + 1 if asset.source else None
                 )
 
     current_source_keys = set(current_state.source_hashes)
@@ -93,10 +89,23 @@ def plan(
             continue
         if selected.source_names is not None and source_name not in selected.source_names:
             continue
-        operations.extend(
+        delete_operations.extend(
             _delete_operations_for_source(manifest, selected.assets, source_name, item_key)
         )
 
+    operations = [
+        _operation(
+            manifest,
+            op_type="build_scope",
+            asset_name=asset_name,
+            item_keys=sorted(item_keys),
+            source_name=source_name,
+            reason=reason,
+            count=build_counts[(asset_name, source_name, reason)],
+        )
+        for (asset_name, source_name, reason), item_keys in sorted(build_groups.items())
+    ]
+    operations.extend(delete_operations)
     if not operations:
         return []
     return _with_dependencies(manifest, operations)
@@ -135,7 +144,7 @@ def _expected_instance(
         raise ValueError(f"asset {asset.name} has no expected upstream instance")
     output_label = asset.config.get("output_label")
     if isinstance(output_label, str) and output_label:
-        instance_key = _fanout_instance_key(source_item_key, output_label, 0)
+        instance_key = _fanout_instance_key(upstreams[0].instance_key, output_label, 0)
     else:
         instance_key = upstreams[0].instance_key
     fingerprint = input_fingerprint(
@@ -203,40 +212,60 @@ def _operation(
     *,
     op_type: str,
     asset_name: str,
-    item_key: str,
+    item_key: str | None = None,
+    item_keys: list[str] | None = None,
     source_name: str,
     reason: str,
     count: int | None = None,
 ) -> Operation:
-    safe_item = item_key.replace("/", "_").replace("\\", "_")
-    op_id = f"{op_type}:{asset_name}:{safe_item}"
+    scoped_items = item_keys or ([item_key] if item_key is not None else [])
+    if item_key is not None:
+        safe_scope = item_key.replace("/", "_").replace("\\", "_")
+    else:
+        safe_scope = f"{source_name}:{len(scoped_items)}"
+    op_id = f"{op_type}:{asset_name}:{reason}:{safe_scope}"
     return Operation(
         op_id=op_id,
         op_type=op_type,  # type: ignore[arg-type]
         asset_name=asset_name,
         project_id=manifest.context.project_id,
         tenant_id=manifest.context.tenant_id,
-        scope=OperationScope(source_name=source_name, item_key=item_key),
+        scope=OperationScope(
+            source_name=source_name,
+            item_key=item_key,
+            item_keys=scoped_items,
+        ),
         reason=reason,
         estimated_instance_count=count,
     )
 
 
 def _with_dependencies(manifest: Manifest, operations: list[Operation]) -> list[Operation]:
-    by_item: dict[str, list[Operation]] = {}
-    for operation in operations:
-        by_item.setdefault(operation.scope.item_key or "", []).append(operation)
-
     order = {asset_name: index for index, asset_name in enumerate(manifest.asset_order)}
-    sorted_ops: list[Operation] = []
-    for item_key in sorted(by_item):
-        item_ops = sorted(by_item[item_key], key=lambda op: order.get(op.asset_name, 9999))
-        previous: Operation | None = None
-        for operation in item_ops:
-            if previous and operation.op_type == "build_scope":
-                operation.depends_on.append(previous.op_id)
-            sorted_ops.append(operation)
-            previous = operation
+    sorted_ops = sorted(
+        operations,
+        key=lambda op: (
+            0 if op.op_type == "delete_scope" else 1,
+            order.get(op.asset_name, 9999),
+            op.scope.source_name or "",
+            op.reason,
+            op.scope.item_key or ",".join(op.scope.item_keys),
+        ),
+    )
+    build_by_scope = {
+        (operation.asset_name, operation.scope.source_name, operation.reason): operation
+        for operation in sorted_ops
+        if operation.op_type == "build_scope"
+    }
+    for operation in sorted_ops:
+        if operation.op_type != "build_scope":
+            continue
+        for dependency in _asset_dependencies(manifest.assets[operation.asset_name]):
+            upstream = build_by_scope.get(
+                (dependency, operation.scope.source_name, operation.reason)
+            )
+            if upstream is not None and upstream.op_id not in operation.depends_on:
+                operation.depends_on.append(upstream.op_id)
     return sorted_ops
 
 

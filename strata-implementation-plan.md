@@ -345,6 +345,8 @@ class OperationPlugin(Protocol):
         ...
 ```
 
+An operation may validly return an empty output list. This is treated as a successful no-output execution, not as a failed operation. Phase 0 does not write cache markers for empty output groups, so such work may be repeated by future plans. That is acceptable for the prototype; an explicit empty-output marker can be added later if repeated filters become expensive.
+
 Assets may opt into larger plugin calls with `execution.inputs_per_call`. The minimum is `1`. This lets an embedding operation receive many chunk inputs in one sync plugin call while the runtime still commits each returned embedding as its own asset instance. Separately, `execution.window_size` controls how many invocation batches the runtime hands to the async runner before waiting and committing results. Windows are formed across the whole asset dependency layer, not only within a single source-scoped planned operation, so small inputs from many source items can still fill efficient runner windows. Artifact outputs returned by a window are grouped by partition before writing, so the local artifact collection writes one payload/manifest pair per window/partition instead of one pair per output item. Runners may do their own lower-level batching, concurrency, and activity scheduling inside each window.
 
 Pipeline YAML is therefore operation-centric:

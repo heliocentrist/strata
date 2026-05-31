@@ -20,7 +20,7 @@ def print_operations(console: Console, operations: Sequence[Operation]) -> None:
     table.add_column("Reason")
     table.add_column("Count")
     for operation in operations:
-        item = operation.scope.item_key or operation.scope.upstream_instance_key or ""
+        item = _operation_scope_label(operation)
         count = (
             str(operation.estimated_instance_count)
             if operation.estimated_instance_count is not None
@@ -30,6 +30,17 @@ def print_operations(console: Console, operations: Sequence[Operation]) -> None:
     console.print(table)
     if not operations:
         console.print("[green]Plan is empty.[/green]")
+
+
+def _operation_scope_label(operation: Operation) -> str:
+    if operation.scope.item_key:
+        return operation.scope.item_key
+    if operation.scope.item_keys:
+        if len(operation.scope.item_keys) == 1:
+            return operation.scope.item_keys[0]
+        source = operation.scope.source_name or "source"
+        return f"{source}: {len(operation.scope.item_keys)} items"
+    return operation.scope.upstream_instance_key or ""
 
 
 def print_doctor(console: Console, issues: Sequence[DoctorIssue], fixed: int, fix: bool) -> None:

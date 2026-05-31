@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Annotated
 
@@ -87,7 +88,15 @@ def apply_command(
     project: ProjectOption = Path("strata.yml"),
     asset: AssetOption = None,
     select: SelectOption = None,
+    debug: Annotated[
+        bool, typer.Option("--debug", help="Print debug execution logs")
+    ] = False,
 ) -> None:
+    if debug:
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format="%(levelname)s %(name)s %(message)s",
+        )
     repo, manifest = _repo(project)
     snapshots = snapshot_sources(manifest.sources, root=manifest.root)
     operations = plan(manifest, repo.snapshot(), snapshots, _selector(select, asset))

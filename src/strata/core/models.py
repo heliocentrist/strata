@@ -103,6 +103,7 @@ class CurrentState(BaseModel):
 class OperationScope(BaseModel):
     source_name: str | None = None
     item_key: str | None = None
+    item_keys: list[str] = Field(default_factory=list)
     upstream_asset_name: str | None = None
     upstream_instance_key: str | None = None
 

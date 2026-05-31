@@ -118,15 +118,6 @@ class LocalSqliteVectorSinkOperation:
         source_item_key = str(
             chunk.metadata.get("source_item_key") or _source_key(chunk.instance_key)
         )
-        repo = config.get("_strata_repo")
-        if repo is not None:
-            repo.upsert_vector(
-                instance_key=chunk.instance_key,
-                embedding_fingerprint=embedding.input_fingerprint or "",
-                source_item_key=source_item_key,
-                chunk_text=str(chunk.data),
-                embedding=vector,
-            )
         output_hash = hash_canonical(
             {
                 "chunk": chunk.instance_key,
@@ -139,6 +130,13 @@ class LocalSqliteVectorSinkOperation:
                 instance_key=chunk.instance_key,
                 output_location=f"sqlite://local_vector_sink/{chunk.instance_key}",
                 output_hash=output_hash,
+                data={
+                    "instance_key": chunk.instance_key,
+                    "embedding_fingerprint": embedding.input_fingerprint or "",
+                    "source_item_key": source_item_key,
+                    "chunk_text": str(chunk.data),
+                    "embedding": vector,
+                },
                 parent_input_ids=[chunk.input_id, embedding.input_id],
                 metadata={
                     "source_item_key": source_item_key,

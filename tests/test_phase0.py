@@ -169,7 +169,10 @@ def test_source_selector_limits_plan_to_source(tmp_path: Path) -> None:
     )
 
     assert [operation.scope.source_name for operation in operations] == ["docs"] * len(operations)
-    assert {operation.scope.item_key for operation in operations} == {"a.md", "b.md"}
+    assert [operation.scope.item_key for operation in operations] == [None] * len(operations)
+    assert [operation.scope.item_keys for operation in operations] == [
+        ["a.md", "b.md"]
+    ] * len(operations)
 
 
 def test_deleted_file_tombstones_instances_and_removes_sink_rows(tmp_path: Path) -> None:
