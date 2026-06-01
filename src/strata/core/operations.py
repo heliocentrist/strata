@@ -20,6 +20,7 @@ class OperationInput:
     path: Path | None = None
     uri: str | None = None
     artifact_location: str | None = None
+    artifact_collection: str | None = None
     partition_key: str | None = None
 
 

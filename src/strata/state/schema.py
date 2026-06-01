@@ -40,7 +40,9 @@ asset_instances = Table(
     Column("instance_key", String, nullable=False),
     Column("source_name", String),
     Column("source_item_key", String),
+    Column("scope_fingerprint", String),
     Column("input_fingerprint", String, nullable=False),
+    Column("artifact_collection", String, nullable=False),
     Column("output_location", Text),
     Column("output_hash", String),
     Column("content_hash", String),
@@ -75,6 +77,38 @@ Index(
     asset_instances.c.source_name,
     asset_instances.c.source_item_key,
     asset_instances.c.status,
+)
+
+asset_scope_completions = Table(
+    "asset_scope_completions",
+    metadata,
+    Column("project_id", String, nullable=False),
+    Column("tenant_id", String, nullable=False),
+    Column("asset_name", String, nullable=False),
+    Column("source_name", String, nullable=False),
+    Column("source_item_key", String, nullable=False),
+    Column("scope_fingerprint", String, nullable=False),
+    Column("expected_instance_count", String, nullable=False),
+    Column("status", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint(
+        "project_id",
+        "tenant_id",
+        "asset_name",
+        "source_name",
+        "source_item_key",
+        "scope_fingerprint",
+    ),
+)
+Index(
+    "ix_asset_scope_completions_lookup",
+    asset_scope_completions.c.project_id,
+    asset_scope_completions.c.tenant_id,
+    asset_scope_completions.c.asset_name,
+    asset_scope_completions.c.source_name,
+    asset_scope_completions.c.source_item_key,
+    asset_scope_completions.c.status,
 )
 
 lineage_edges = Table(
@@ -181,8 +215,6 @@ apply_locks = Table(
     Column("tenant_id", String, nullable=False),
     Column("run_id", String, nullable=False),
     Column("acquired_at", DateTime(timezone=True), nullable=False),
-    Column("heartbeat_at", DateTime(timezone=True), nullable=False),
-    Column("expires_at", DateTime(timezone=True), nullable=False),
     UniqueConstraint("project_id", "tenant_id"),
 )
 
@@ -191,12 +223,19 @@ vector_sink = Table(
     metadata,
     Column("project_id", String, nullable=False),
     Column("tenant_id", String, nullable=False),
+    Column("source_name", String, nullable=False),
+    Column("source_item_key", String, nullable=False),
     Column("instance_key", String, nullable=False),
     Column("embedding_fingerprint", String, nullable=False),
-    Column("source_item_key", String, nullable=False),
     Column("chunk_text", Text, nullable=False),
     Column("embedding_json", Text, nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False),
-    UniqueConstraint("project_id", "tenant_id", "instance_key", "embedding_fingerprint"),
+    UniqueConstraint(
+        "project_id",
+        "tenant_id",
+        "source_name",
+        "instance_key",
+        "embedding_fingerprint",
+    ),
 )
 

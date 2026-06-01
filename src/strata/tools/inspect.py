@@ -159,6 +159,7 @@ def _asset_summary(row: dict[str, Any]) -> dict[str, Any]:
         "content_hash": row["content_hash"],
         "output_hash": row["output_hash"],
         "output_location": row["output_location"],
+        "artifact_collection": row["artifact_collection"],
         "materialization_strategy": row["materialization_strategy"],
         "metadata": _json_object(row["metadata_json"]),
         "transform": {
@@ -197,7 +198,11 @@ def _artifact_summary(
     if location.startswith("sqlite://"):
         return _sink_summary(repo, row, preview_chars)
     try:
-        artifact_doc = _read_artifact_doc(manifest, location)
+        artifact_doc = _read_artifact_doc(
+            manifest,
+            location,
+            str(row.get("artifact_collection") or "local_json"),
+        )
     except (OSError, ValueError, KeyError, json.JSONDecodeError, IndexError) as exc:
         return {"readable": False, "error": str(exc)}
 
@@ -244,8 +249,12 @@ def _sink_summary(
     }
 
 
-def _read_artifact_doc(manifest: Manifest, location: str) -> dict[str, Any]:
-    return read_artifact(manifest, location)
+def _read_artifact_doc(
+    manifest: Manifest,
+    location: str,
+    artifact_collection: str,
+) -> dict[str, Any]:
+    return read_artifact(manifest, location, artifact_collection)
 
 
 def _preview(data: Any, preview_chars: int) -> str:

@@ -2,16 +2,14 @@
 
 import json
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 from sqlalchemy import select
 
 from strata.core.models import Manifest, TestSpec
+from strata.execution.artifacts import read_artifact_ref
 from strata.state.repository import StateRepository
 from strata.state.schema import asset_instances
-
-ARTIFACT_URI_PREFIX = "artifact://"
 
 
 @dataclass(frozen=True)
@@ -63,7 +61,11 @@ def _test_not_empty(
     unreadable: list[str] = []
     for row in rows:
         try:
-            data = _artifact_data(manifest, str(row["output_location"]))
+            data = _artifact_data(
+                manifest,
+                str(row["output_location"]),
+                str(row.get("artifact_collection") or "local_json"),
+            )
         except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
             unreadable.append(f"{row['instance_key']}: {exc}")
             continue
@@ -94,7 +96,11 @@ def _test_embedding_dimensions(
     unreadable: list[str] = []
     for row in rows:
         try:
-            data = _artifact_data(manifest, str(row["output_location"]))
+            data = _artifact_data(
+                manifest,
+                str(row["output_location"]),
+                str(row.get("artifact_collection") or "local_json"),
+            )
         except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
             unreadable.append(f"{row['instance_key']}: {exc}")
             continue
@@ -139,31 +145,11 @@ def _materialized_rows(repo: StateRepository, asset_name: str) -> list[dict[str,
     return [dict(row) for row in rows]
 
 
-def _artifact_data(manifest: Manifest, location: str) -> Any:
-    if location.startswith(ARTIFACT_URI_PREFIX):
-        return _fanout_artifact_data(manifest, location)
+def _artifact_data(manifest: Manifest, location: str, artifact_collection: str) -> Any:
     if location.startswith("sqlite://"):
         raise ValueError("sink artifact data is not stored as a JSON artifact")
-    doc = cast(dict[str, Any], json.loads(Path(location).read_text(encoding="utf-8")))
+    doc = read_artifact_ref(manifest.artifacts_path, location, artifact_collection)
     return doc["data"]
-
-
-def _fanout_artifact_data(manifest: Manifest, location: str) -> Any:
-    uri = location.removeprefix(ARTIFACT_URI_PREFIX)
-    if "#item=" not in uri:
-        raise ValueError(f"invalid artifact URI: {location}")
-    manifest_ref, item_ref = uri.split("#item=", 1)
-    item_number = int(item_ref)
-    manifest_path = manifest.artifacts_path / manifest_ref
-    manifest_doc = cast(
-        dict[str, Any], json.loads(manifest_path.read_text(encoding="utf-8"))
-    )
-    item = cast(dict[str, Any], manifest_doc["items"][item_number])
-    payload = cast(dict[str, Any], item["payload"])
-    payload_path = manifest_path.parent.parent / str(payload["path"])
-    record_number = int(payload["record"])
-    record = json.loads(payload_path.read_text(encoding="utf-8").splitlines()[record_number])
-    return record["data"]
 
 
 def _passed(test: TestSpec, message: str) -> TestResult:

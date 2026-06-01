@@ -8,11 +8,12 @@ from sqlalchemy import select
 
 from strata.core.config import load_manifest, state_path_from_url
 from strata.core.hashing import sha256_text
+from strata.core.models import Manifest
 from strata.core.operations import OperationInput, OperationOutput
 from strata.core.planning import plan
 from strata.execution.apply import apply_operations
 from strata.executors.registry import get_operation_runner
-from strata.plugins.protocols import AdapterMetadata
+from strata.plugins.protocols import AdapterMetadata, OperationPlugin
 from strata.plugins.registry import register_operation
 from strata.sources.registry import snapshot_sources
 from strata.state.connection import bootstrap, connect_state
@@ -723,7 +724,7 @@ pipeline:
     return project
 
 
-def _repo(project: Path) -> tuple[object, StateRepository]:
+def _repo(project: Path) -> tuple[Manifest, StateRepository]:
     manifest = load_manifest(project)
     engine = connect_state(state_path_from_url(manifest.state_url, manifest.root))
     bootstrap(engine)
@@ -744,12 +745,13 @@ def _asset_counts(repo: StateRepository) -> dict[str, int]:
 
 
 def _register_shape_operations() -> None:
-    for name, operation in {
+    operations: dict[str, OperationPlugin] = {
         "test_line_fanout": LineFanoutOperation(),
         "test_word_fanout": WordFanoutOperation(),
         "test_suffix_map": SuffixMapOperation(),
         "test_empty_fanout": EmptyFanoutOperation(),
-    }.items():
+    }
+    for name, operation in operations.items():
         register_operation(
             name,
             operation,

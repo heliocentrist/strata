@@ -12,6 +12,7 @@ from strata.core.models import (
     SourceSnapshot,
     SourceSnapshotMode,
 )
+from strata.core.scopes import asset_scope_fingerprint
 from strata.core.selectors import parse_selection
 
 
@@ -60,6 +61,7 @@ def plan(
             root_reason = ""
 
         expected: dict[str, _ExpectedInstance] = {}
+        scope_fingerprints: dict[str, str] = {}
         reasons: dict[str, str] = {}
         for asset_name in manifest.asset_order:
             asset = manifest.assets[asset_name]
@@ -67,13 +69,25 @@ def plan(
                 continue
             expected_instance = _expected_instance(asset, item_key, item.content_hash, expected)
             expected[asset_name] = expected_instance
-            upstream_reason = _upstream_reason(asset, reasons)
-            current = (
+            scope_fingerprints[asset_name] = asset_scope_fingerprint(
+                manifest,
                 asset_name,
-                expected_instance.instance_key,
-                expected_instance.input_fingerprint,
-            ) in current_state.materialized
-            reason = root_reason or upstream_reason or ("" if current else _missing_reason(asset))
+                source_name=source_name,
+                source_item_key=item_key,
+                source_content_hash=item.content_hash,
+            )
+            upstream_reason = _upstream_reason(asset, reasons)
+            scope_key = (
+                asset_name,
+                source_name,
+                item_key,
+                scope_fingerprints[asset_name],
+            )
+            completed = scope_key in current_state.completed_scopes
+            incomplete = scope_key in current_state.incomplete_scopes
+            reason = root_reason or upstream_reason or (
+                "" if completed and not incomplete else _missing_reason(asset)
+            )
             reasons[asset_name] = reason
             if reason and asset_name in selected.assets:
                 key = (asset_name, source_name, reason)
@@ -191,6 +205,7 @@ def _delete_operations_for_source(
         )
         for asset in _terminal_assets(manifest)
         if asset.name in selected_assets
+        and _asset_applies_to_source(manifest, asset, source_name)
     ]
 
 

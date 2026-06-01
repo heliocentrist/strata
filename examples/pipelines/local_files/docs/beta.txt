@@ -1,0 +1,4 @@
+Beta document for the local files example.
+
+The pipeline parses local files, chunks the text, creates deterministic fake embeddings,
+and writes a small SQLite sink for inspection.

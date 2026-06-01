@@ -1,13 +1,13 @@
 ﻿from __future__ import annotations
 
 import json
-from datetime import timedelta
 from pathlib import Path
 
 from conftest import write_project
 from sqlalchemy import insert, select
 
 from strata.core.config import load_manifest, state_path_from_url
+from strata.core.models import Manifest
 from strata.core.planning import plan
 from strata.execution.apply import apply_operations
 from strata.sources.registry import snapshot_sources
@@ -21,7 +21,7 @@ from strata.state.schema import (
 from strata.tools.doctor import run_doctor
 
 
-def setup_repo(project: Path) -> tuple[object, StateRepository]:
+def setup_repo(project: Path) -> tuple[Manifest, StateRepository]:
     manifest = load_manifest(project)
     engine = connect_state(state_path_from_url(manifest.state_url, manifest.root))
     bootstrap(engine)
@@ -97,8 +97,8 @@ def test_fanout_instances_have_distinct_fingerprints_and_artifact_identity(
     fanout_manifest_path = manifest.artifacts_path / manifest_ref
     fanout_manifest = json.loads(fanout_manifest_path.read_text(encoding="utf-8"))
     assert fanout_manifest_path.parent.name == "manifests"
-    assert fanout_manifest_path.name.startswith(fanout_manifest["created_at"][:10].replace("-", ""))
-    assert fanout_manifest["manifest_hash"][:12] in fanout_manifest_path.name
+    assert fanout_manifest_path.name == f"{fanout_manifest['window_id']}.json"
+    assert "created_at" not in fanout_manifest
     assert fanout_manifest["asset_name"] == "chunks"
     assert fanout_manifest["partition_key"] == parent_fingerprint
     assert fanout_manifest["collection"]["type"] == "local_json"
@@ -139,8 +139,21 @@ def test_chunk_config_change_reuses_parsed_and_rebuilds_downstream(tmp_path: Pat
         encoding="utf-8",
     )
     changed_manifest = load_manifest(project)
-    operations = plan(changed_manifest, repo.snapshot(), snapshot_sources(changed_manifest.sources))
+    changed_snapshots = snapshot_sources(changed_manifest.sources)
+    operations = plan(changed_manifest, repo.snapshot(), changed_snapshots)
     assert [op.asset_name for op in operations] == ["chunks", "embeddings", "sink"]
+    result = apply_operations(
+        manifest=changed_manifest,
+        repo=repo,
+        source_snapshots=changed_snapshots,
+        operations=operations,
+    )
+    assert result["failed"] == 0
+    assert plan(
+        changed_manifest,
+        repo.snapshot(),
+        snapshot_sources(changed_manifest.sources),
+    ) == []
 
 
 def test_select_chunks_only_limits_plan_to_chunks(tmp_path: Path) -> None:
@@ -205,7 +218,7 @@ def test_deleted_file_tombstones_instances_and_removes_sink_rows(tmp_path: Path)
     assert sink_rows == []
 
 
-def test_doctor_reports_and_fixes_expired_locks_and_orphan_files(tmp_path: Path) -> None:
+def test_doctor_reports_and_fixes_apply_locks_and_orphan_files(tmp_path: Path) -> None:
     project = write_project(tmp_path)
     manifest, repo = setup_repo(project)
     apply_operations(
@@ -224,15 +237,13 @@ def test_doctor_reports_and_fixes_expired_locks_and_orphan_files(tmp_path: Path)
             insert(apply_locks).values(
                 project_id=manifest.context.project_id,
                 tenant_id=manifest.context.tenant_id,
-                run_id="expired-run",
-                acquired_at=timestamp - timedelta(hours=2),
-                heartbeat_at=timestamp - timedelta(hours=2),
-                expires_at=timestamp - timedelta(hours=1),
+                run_id="locked-run",
+                acquired_at=timestamp,
             )
         )
 
     result = run_doctor(manifest=manifest, repo=repo)
-    assert {issue.code for issue in result.issues} >= {"expired_lock", "orphan_file"}
+    assert {issue.code for issue in result.issues} >= {"apply_lock", "orphan_file"}
 
     fixed = run_doctor(manifest=manifest, repo=repo, fix=True)
     assert fixed.fixed >= 2

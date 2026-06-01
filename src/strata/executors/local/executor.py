@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
+from typing import Any
 
 from strata.core.collections import (
     ArtifactPayload,
@@ -12,7 +13,7 @@ from strata.core.collections import (
 )
 from strata.core.hashing import hash_canonical, input_fingerprint, sha256_text
 from strata.core.operations import OperationInput, OperationOutput
-from strata.execution.artifacts import read_artifact_ref
+from strata.execution.artifacts import read_artifact_refs
 from strata.executors.protocols import (
     OperationInvocation,
     OperationWindow,
@@ -23,24 +24,21 @@ from strata.plugins.registry import get_artifact_collection, get_operation
 
 @dataclass(frozen=True)
 class InlineOperationRunner:
-    async def run(self, invocation: OperationInvocation) -> list[OperationOutput]:
+    async def _run_invocation(self, invocation: OperationInvocation) -> list[OperationOutput]:
         return get_operation(invocation.operation_name).run(
             invocation.inputs,
             invocation.config,
         )
 
-    async def run_many(
-        self,
-        invocations: list[OperationInvocation],
-    ) -> list[list[OperationOutput]]:
-        return [await self.run(invocation) for invocation in invocations]
-
     async def run_window(self, window: OperationWindow) -> OperationWindowResult:
+        input_payloads = _read_window_input_payloads(window)
         return OperationWindowResult(
             output_groups=_write_window_outputs(
                 window,
                 [
-                    await self.run(_materialize_invocation(window, invocation))
+                    await self._run_invocation(
+                        _materialize_invocation(invocation, input_payloads)
+                    )
                     for invocation in window.invocations
                 ],
             )
@@ -51,7 +49,7 @@ class InlineOperationRunner:
 class ThreadedOperationRunner:
     max_workers: int = 4
 
-    async def run(self, invocation: OperationInvocation) -> list[OperationOutput]:
+    async def _run_invocation(self, invocation: OperationInvocation) -> list[OperationOutput]:
         return await asyncio.to_thread(self._run_sync, invocation)
 
     def _run_sync(self, invocation: OperationInvocation) -> list[OperationOutput]:
@@ -60,19 +58,20 @@ class ThreadedOperationRunner:
             invocation.config,
         )
 
-    async def run_many(
+    async def _run_invocations(
         self,
         invocations: list[OperationInvocation],
     ) -> list[list[OperationOutput]]:
         return await asyncio.to_thread(self._run_many_sync, invocations)
 
     async def run_window(self, window: OperationWindow) -> OperationWindowResult:
+        input_payloads = _read_window_input_payloads(window)
         invocations = [
-            _materialize_invocation(window, invocation)
+            _materialize_invocation(invocation, input_payloads)
             for invocation in window.invocations
         ]
         return OperationWindowResult(
-            output_groups=_write_window_outputs(window, await self.run_many(invocations))
+            output_groups=_write_window_outputs(window, await self._run_invocations(invocations))
         )
 
     def _run_many_sync(
@@ -111,30 +110,59 @@ register_builtin_executors = register_builtin_operation_runners
 
 
 def _materialize_invocation(
-    window: OperationWindow,
     invocation: OperationInvocation,
+    input_payloads: dict[str, dict[str, Any]],
 ) -> OperationInvocation:
     return replace(
         invocation,
         inputs=[
-            _materialize_input(window, input_item)
+            _materialize_input(input_item, input_payloads)
             for input_item in invocation.inputs
         ],
     )
 
 
 def _materialize_input(
-    window: OperationWindow,
     input_item: OperationInput,
+    input_payloads: dict[str, dict[str, Any]],
 ) -> OperationInput:
     if input_item.artifact_location is None:
         return input_item
-    payload = read_artifact_ref(window.artifact_root, input_item.artifact_location)
+    payload = input_payloads[input_item.input_id]
     return replace(
         input_item,
         data=payload.get("data"),
         metadata={**input_item.metadata, **dict(payload.get("metadata") or {})},
     )
+
+
+def _read_window_input_payloads(window: OperationWindow) -> dict[str, dict[str, Any]]:
+    input_refs = [
+        (
+            input_item.input_id,
+            input_item.artifact_collection or "local_json",
+            input_item.artifact_location,
+        )
+        for invocation in window.invocations
+        for input_item in invocation.inputs
+        if input_item.artifact_location is not None
+    ]
+    if not input_refs:
+        return {}
+    payloads = read_artifact_refs(
+        window.artifact_root,
+        [
+            (collection_name, str(location))
+            for _input_id, collection_name, location in input_refs
+            if location is not None
+        ],
+    )
+    return {
+        input_id: payload
+        for (input_id, _collection_name, _location), payload in zip(
+            input_refs, payloads, strict=True
+        )
+    }
 
 
 def _write_window_outputs(
@@ -184,6 +212,7 @@ def _write_window_outputs(
             CollectionWriteContext(
                 root_path=window.artifact_root,
                 asset_name=window.asset_name,
+                window_id=window.window_id,
             ),
             write,
         )
@@ -205,6 +234,7 @@ def _write_window_outputs(
                 root_path=window.artifact_root,
                 asset_name=window.asset_name,
                 partition_key=partition_key,
+                window_id=window.window_id,
             ),
             [item[4] for item in items],
         )

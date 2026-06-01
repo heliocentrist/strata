@@ -1,0 +1,47 @@
+project_id: threaded-runner-example
+tenant_id: default
+
+state:
+  url: sqlite:///./.strata/state.db
+
+artifacts:
+  path: ./.strata/artifacts
+
+execution:
+  executor: local_threaded
+  config:
+    max_workers: 2
+    window_size: 2
+
+sources:
+  docs:
+    type: local_files
+    path: ./docs
+    include: ["**/*.md"]
+
+pipeline:
+  parsed:
+    source: docs
+    operation: markdown_noop
+    version: markdown_noop@0.1.0
+
+  chunks:
+    input: parsed
+    operation: fixed_token_chunker
+    version: fixed_token_chunker@0.1.0
+    config:
+      output_label: chunk
+      max_chars: 80
+      overlap_chars: 0
+
+  embeddings:
+    input: chunks
+    operation: fake_embedding
+    version: fake_embedding@0.1.0
+    config:
+      dimensions: 4
+
+  sink:
+    input: embeddings
+    operation: local_sqlite_vector_sink
+    version: local_sqlite_vector_sink@0.1.0

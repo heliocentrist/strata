@@ -5,6 +5,7 @@ from pathlib import Path
 from conftest import write_project
 
 from strata.core.config import load_manifest, state_path_from_url
+from strata.core.models import Manifest
 from strata.core.planning import plan
 from strata.execution.apply import apply_operations
 from strata.sources.registry import snapshot_sources
@@ -13,7 +14,7 @@ from strata.state.repository import StateRepository
 from strata.tools.testing import run_tests
 
 
-def setup_repo(project: Path) -> tuple[object, StateRepository]:
+def setup_repo(project: Path) -> tuple[Manifest, StateRepository]:
     manifest = load_manifest(project)
     engine = connect_state(state_path_from_url(manifest.state_url, manifest.root))
     bootstrap(engine)

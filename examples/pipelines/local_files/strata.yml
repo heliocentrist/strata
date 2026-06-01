@@ -1,4 +1,4 @@
-project_id: demo
+project_id: local-files-example
 tenant_id: default
 
 state:
@@ -7,16 +7,11 @@ state:
 artifacts:
   path: ./.strata/artifacts
 
-execution:
-  executor: local_single_thread
-  config:
-    max_workers: 1
-
 sources:
   docs:
     type: local_files
-    path: .
-    include: ["*.txt", "*.md", "*.pdf"]
+    path: ./docs
+    include: ["**/*.md", "**/*.txt"]
 
 pipeline:
   parsed:
@@ -30,20 +25,20 @@ pipeline:
     version: fixed_token_chunker@0.1.0
     config:
       output_label: chunk
-      max_chars: 1200
-      overlap_chars: 120
+      max_chars: 120
+      overlap_chars: 10
 
   embeddings:
     input: chunks
     operation: fake_embedding
     version: fake_embedding@0.1.0
     config:
-      dimensions: 16
+      dimensions: 8
 
   sink:
     input: embeddings
     operation: local_sqlite_vector_sink
-    version: sink@0.1.0
+    version: local_sqlite_vector_sink@0.1.0
 
 tests:
   - name: chunks_not_empty

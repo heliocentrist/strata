@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
 from sqlalchemy import select
 
 from strata.core.config import load_manifest, state_path_from_url
+from strata.core.models import Manifest
 from strata.core.planning import plan
 from strata.execution.apply import apply_operations
 from strata.sources.registry import snapshot_sources
@@ -16,7 +16,6 @@ from strata.state.schema import asset_instances, source_state, vector_sink
 
 def test_object_store_source_discovers_full_and_delta_loads_without_manifest(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     project = _write_object_store_project(tmp_path)
     objects = tmp_path / "objects"
@@ -66,11 +65,7 @@ def test_object_store_source_discovers_full_and_delta_loads_without_manifest(
     assert [operation.reason for operation in changed_operations] == ["source_changed"] * 4
     assert [operation.scope.item_keys for operation in changed_operations] == [["a.md"]] * 4
 
-    def fail_descendant_lookup(*args: object, **kwargs: object) -> None:
-        _ = args, kwargs
-        raise AssertionError("apply should use source-scoped asset lookup")
-
-    monkeypatch.setattr(repo, "materialized_descendants", fail_descendant_lookup)
+    assert not hasattr(repo, "materialized_descendants")
     changed = apply_operations(
         manifest=manifest,
         repo=repo,
@@ -159,7 +154,7 @@ pipeline:
     return project
 
 
-def _repo(project: Path) -> tuple[object, StateRepository]:
+def _repo(project: Path) -> tuple[Manifest, StateRepository]:
     manifest = load_manifest(project)
     engine = connect_state(state_path_from_url(manifest.state_url, manifest.root))
     bootstrap(engine)

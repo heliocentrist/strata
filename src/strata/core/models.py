@@ -95,7 +95,8 @@ class SourceSnapshot(BaseModel):
 class CurrentState(BaseModel):
     source_hashes: dict[tuple[str, str], str] = Field(default_factory=dict)
     deleted_sources: set[tuple[str, str]] = Field(default_factory=set)
-    materialized: set[tuple[str, str, str]] = Field(default_factory=set)
+    completed_scopes: set[tuple[str, str, str, str]] = Field(default_factory=set)
+    incomplete_scopes: set[tuple[str, str, str, str]] = Field(default_factory=set)
     failed: set[tuple[str, str]] = Field(default_factory=set)
 
 
@@ -136,6 +137,8 @@ class MaterializedArtifact(BaseModel):
     input_fingerprint: str
     source_name: str | None = None
     source_item_key: str | None = None
+    scope_fingerprint: str | None = None
+    artifact_collection: str = "local_json"
     output_location: str | None = None
     output_hash: str | None = None
     content_hash: str | None = None
@@ -149,6 +152,8 @@ class AssetInstanceCommit(BaseModel):
     output_location: str
     source_name: str | None = None
     source_item_key: str | None = None
+    scope_fingerprint: str | None = None
+    artifact_collection: str = "local_json"
     output_hash: str | None = None
     content_hash: str | None = None
     transform_id: str

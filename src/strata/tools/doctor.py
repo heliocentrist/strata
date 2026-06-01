@@ -2,7 +2,7 @@
 
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -48,7 +48,7 @@ def run_doctor(*, manifest: Manifest, repo: StateRepository, fix: bool = False) 
     issues.extend(_orphan_file_issues(manifest, expected_files))
 
     if fix:
-        fixed += _fix_expired_locks(repo)
+        fixed += _fix_apply_locks(repo)
         fixed += _fix_abandoned_runs(repo)
         fixed += _fix_broken_asset_instances(repo, artifact_issues)
         fixed += _fix_orphan_files(manifest, issues)
@@ -57,44 +57,26 @@ def run_doctor(*, manifest: Manifest, repo: StateRepository, fix: bool = False) 
 
 
 def _lock_issues(repo: StateRepository) -> list[DoctorIssue]:
-    timestamp = now()
     issues: list[DoctorIssue] = []
     for row in _context_rows(repo, apply_locks):
-        expires_at = _as_utc(row["expires_at"])
-        if expires_at < timestamp:
-            issues.append(
-                DoctorIssue(
-                    code="expired_lock",
-                    severity="error",
-                    message=(
-                        "Apply lock expired "
-                        f"for run {row['run_id']} at {expires_at.isoformat()}"
-                    ),
-                    fixable=True,
-                )
+        acquired_at = row["acquired_at"]
+        acquired = (
+            acquired_at.isoformat() if isinstance(acquired_at, datetime) else str(acquired_at)
+        )
+        issues.append(
+            DoctorIssue(
+                code="apply_lock",
+                severity="warning",
+                message=f"Apply lock is present for run {row['run_id']} since {acquired}",
+                fixable=True,
             )
-        else:
-            issues.append(
-                DoctorIssue(
-                    code="active_lock",
-                    severity="warning",
-                    message=(
-                        "Apply lock is active "
-                        f"for run {row['run_id']} until {expires_at.isoformat()}"
-                    ),
-                )
-            )
+        )
     return issues
 
 
 def _running_run_issues(repo: StateRepository) -> list[DoctorIssue]:
-    timestamp = now()
     lock_rows = _context_rows(repo, apply_locks)
-    active_lock_run_ids = {
-        str(row["run_id"])
-        for row in lock_rows
-        if _as_utc(row["expires_at"]) >= timestamp
-    }
+    active_lock_run_ids = {str(row["run_id"]) for row in lock_rows}
     issues: list[DoctorIssue] = []
     for row in _context_rows(repo, runs):
         if row["status"] != "running":
@@ -211,10 +193,17 @@ def _manifest_hash_issues(
     actual_hash = hash_canonical(hash_payload)
     if actual_hash != manifest_hash:
         return [_broken_artifact_issue(row, f"fanout manifest hash mismatch: {manifest_path}")]
-    if manifest_hash[:12] not in manifest_path.name:
+    window_id = manifest_doc.get("window_id")
+    if not isinstance(window_id, str) or not window_id:
         return [
             _broken_artifact_issue(
-                row, f"fanout manifest filename hash mismatch: {manifest_path}"
+                row, f"fanout manifest has no window_id: {manifest_path}"
+            )
+        ]
+    if manifest_path.stem != window_id:
+        return [
+            _broken_artifact_issue(
+                row, f"fanout manifest filename does not match window_id: {manifest_path}"
             )
         ]
     return []
@@ -282,14 +271,12 @@ def _orphan_file_issues(manifest: Manifest, expected_files: set[Path]) -> list[D
     return issues
 
 
-def _fix_expired_locks(repo: StateRepository) -> int:
-    timestamp = now()
+def _fix_apply_locks(repo: StateRepository) -> int:
     with repo.begin() as conn:
         result = conn.execute(
             delete(apply_locks).where(
                 apply_locks.c.project_id == repo.context.project_id,
                 apply_locks.c.tenant_id == repo.context.tenant_id,
-                apply_locks.c.expires_at < timestamp,
             )
         )
     return int(result.rowcount or 0)
@@ -298,11 +285,7 @@ def _fix_expired_locks(repo: StateRepository) -> int:
 def _fix_abandoned_runs(repo: StateRepository) -> int:
     timestamp = now()
     lock_rows = _context_rows(repo, apply_locks)
-    active_lock_run_ids = {
-        str(row["run_id"])
-        for row in lock_rows
-        if _as_utc(row["expires_at"]) >= timestamp
-    }
+    active_lock_run_ids = {str(row["run_id"]) for row in lock_rows}
     stale_run_ids = [
         str(row["id"])
         for row in _context_rows(repo, runs)
@@ -435,12 +418,6 @@ def _context_rows(repo: StateRepository, table: Any) -> list[dict[str, Any]]:
             )
         ).mappings().all()
     return [dict(row) for row in rows]
-
-
-def _as_utc(value: datetime) -> datetime:
-    if value.tzinfo is None:
-        return value.replace(tzinfo=UTC)
-    return value.astimezone(UTC)
 
 
 def _is_inside(path: Path, root: Path) -> bool:

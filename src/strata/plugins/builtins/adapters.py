@@ -106,6 +106,7 @@ class FakeEmbeddingOperation:
                         "upstream_instance_key": upstream.instance_key,
                         "chunk_instance_key": upstream.instance_key,
                         "chunk_text": str(upstream.data),
+                        "source_name": upstream.source_name,
                         "source_item_key": (
                             upstream.metadata.get("source_item_key")
                             or _source_key(upstream.instance_key)
@@ -130,11 +131,13 @@ class LocalSqliteVectorSinkOperation:
             source_item_key = str(
                 embedding.metadata.get("source_item_key") or _source_key(chunk_instance_key)
             )
+            source_name = str(embedding.metadata.get("source_name") or embedding.source_name or "")
             chunk_text = str(embedding.metadata.get("chunk_text") or "")
             output_hash = hash_canonical(
                 {
                     "chunk": chunk_instance_key,
                     "embedding": vector,
+                    "source_name": source_name,
                     "source": source_item_key,
                 }
             )
@@ -145,6 +148,7 @@ class LocalSqliteVectorSinkOperation:
                     output_hash=output_hash,
                     parent_input_ids=[embedding.input_id],
                     metadata={
+                        "source_name": source_name,
                         "source_item_key": source_item_key,
                         "chunk_instance_key": chunk_instance_key,
                     },
@@ -154,6 +158,7 @@ class LocalSqliteVectorSinkOperation:
                 {
                     "instance_key": chunk_instance_key,
                     "embedding_fingerprint": embedding.input_fingerprint or "",
+                    "source_name": source_name,
                     "source_item_key": source_item_key,
                     "chunk_text": chunk_text,
                     "embedding": vector,
@@ -185,35 +190,40 @@ def _write_local_vector_rows(config: dict[str, Any], rows: list[dict[str, Any]])
     tenant_id = str(runtime["tenant_id"])
     engine = connect_state(_state_path_from_url(state_url, project_root))
     bootstrap(engine)
+    timestamp = datetime.now(UTC)
+    values = [
+        {
+            "project_id": project_id,
+            "tenant_id": tenant_id,
+            "source_name": row["source_name"],
+            "source_item_key": row["source_item_key"],
+            "instance_key": row["instance_key"],
+            "embedding_fingerprint": row["embedding_fingerprint"],
+            "chunk_text": row["chunk_text"],
+            "embedding_json": json.dumps(row["embedding"]),
+            "updated_at": timestamp,
+        }
+        for row in rows
+    ]
     with engine.begin() as conn:
-        for row in rows:
-            values = {
-                "project_id": project_id,
-                "tenant_id": tenant_id,
-                "instance_key": row["instance_key"],
-                "embedding_fingerprint": row["embedding_fingerprint"],
-                "source_item_key": row["source_item_key"],
-                "chunk_text": row["chunk_text"],
-                "embedding_json": json.dumps(row["embedding"]),
-                "updated_at": datetime.now(UTC),
-            }
-            stmt = sqlite_insert(vector_sink).values(values)
-            conn.execute(
-                stmt.on_conflict_do_update(
-                    index_elements=[
-                        vector_sink.c.project_id,
-                        vector_sink.c.tenant_id,
-                        vector_sink.c.instance_key,
-                        vector_sink.c.embedding_fingerprint,
-                    ],
-                    set_={
-                        "source_item_key": stmt.excluded.source_item_key,
-                        "chunk_text": stmt.excluded.chunk_text,
-                        "embedding_json": stmt.excluded.embedding_json,
-                        "updated_at": stmt.excluded.updated_at,
-                    },
-                )
+        stmt = sqlite_insert(vector_sink).values(values)
+        conn.execute(
+            stmt.on_conflict_do_update(
+                index_elements=[
+                    vector_sink.c.project_id,
+                    vector_sink.c.tenant_id,
+                    vector_sink.c.source_name,
+                    vector_sink.c.instance_key,
+                    vector_sink.c.embedding_fingerprint,
+                ],
+                set_={
+                    "source_item_key": stmt.excluded.source_item_key,
+                    "chunk_text": stmt.excluded.chunk_text,
+                    "embedding_json": stmt.excluded.embedding_json,
+                    "updated_at": stmt.excluded.updated_at,
+                },
             )
+        )
 
 
 def _state_path_from_url(url: str, root: Path) -> Path:

@@ -4,10 +4,10 @@ import json
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import delete, insert, or_, select, update
+from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import IntegrityError
 
@@ -21,6 +21,7 @@ from strata.core.models import (
 from strata.state.schema import (
     apply_locks,
     asset_instances,
+    asset_scope_completions,
     lineage_edges,
     operation_items,
     operation_runs,
@@ -48,6 +49,8 @@ def _artifact_from_row(row: Any) -> MaterializedArtifact:
         input_fingerprint=row["input_fingerprint"],
         source_name=row["source_name"],
         source_item_key=row["source_item_key"],
+        scope_fingerprint=row["scope_fingerprint"],
+        artifact_collection=row["artifact_collection"],
         output_location=row["output_location"],
         output_hash=row["output_hash"],
         content_hash=row["content_hash"],
@@ -73,12 +76,6 @@ class StateRepository:
                     source_state.c.tenant_id == self.context.tenant_id,
                 )
             ).mappings()
-            asset_rows = conn.execute(
-                select(asset_instances).where(
-                    asset_instances.c.project_id == self.context.project_id,
-                    asset_instances.c.tenant_id == self.context.tenant_id,
-                )
-            ).mappings()
             state = CurrentState()
             for row in source_rows:
                 key = (row["source_name"], row["item_key"])
@@ -86,32 +83,60 @@ class StateRepository:
                     state.source_hashes[key] = row["source_content_hash"]
                 else:
                     state.deleted_sources.add(key)
-            for row in asset_rows:
-                key2 = (row["asset_name"], row["instance_key"])
-                if row["status"] == "materialized":
-                    state.materialized.add((*key2, row["input_fingerprint"]))
-                elif row["status"] == "failed":
-                    state.failed.add(key2)
+            completion_rows = conn.execute(
+                select(asset_scope_completions).where(
+                    asset_scope_completions.c.project_id == self.context.project_id,
+                    asset_scope_completions.c.tenant_id == self.context.tenant_id,
+                    asset_scope_completions.c.status == "complete",
+                )
+            ).mappings()
+            materialized_counts = {
+                (
+                    row["asset_name"],
+                    row["source_name"],
+                    row["source_item_key"],
+                    row["scope_fingerprint"],
+                ): int(row["count"])
+                for row in conn.execute(
+                    select(
+                        asset_instances.c.asset_name,
+                        asset_instances.c.source_name,
+                        asset_instances.c.source_item_key,
+                        asset_instances.c.scope_fingerprint,
+                        func.count().label("count"),
+                    )
+                    .where(
+                        asset_instances.c.project_id == self.context.project_id,
+                        asset_instances.c.tenant_id == self.context.tenant_id,
+                        asset_instances.c.status == "materialized",
+                        asset_instances.c.source_name.is_not(None),
+                        asset_instances.c.source_item_key.is_not(None),
+                        asset_instances.c.scope_fingerprint.is_not(None),
+                    )
+                    .group_by(
+                        asset_instances.c.asset_name,
+                        asset_instances.c.source_name,
+                        asset_instances.c.source_item_key,
+                        asset_instances.c.scope_fingerprint,
+                    )
+                ).mappings()
+            }
+            for row in completion_rows:
+                scope_key = (
+                    str(row["asset_name"]),
+                    str(row["source_name"]),
+                    str(row["source_item_key"]),
+                    str(row["scope_fingerprint"]),
+                )
+                if materialized_counts.get(scope_key, 0) == int(row["expected_instance_count"]):
+                    state.completed_scopes.add(scope_key)
+                else:
+                    state.incomplete_scopes.add(scope_key)
             return state
 
-    def acquire_lock(self, run_id: str, ttl_seconds: int = 3600) -> None:
+    def acquire_lock(self, run_id: str) -> None:
         timestamp = now()
-        expires_at = timestamp + timedelta(seconds=ttl_seconds)
         with self.begin() as conn:
-            expired = conn.execute(
-                select(apply_locks).where(
-                    apply_locks.c.project_id == self.context.project_id,
-                    apply_locks.c.tenant_id == self.context.tenant_id,
-                    apply_locks.c.expires_at < timestamp,
-                )
-            ).first()
-            if expired:
-                conn.execute(
-                    delete(apply_locks).where(
-                        apply_locks.c.project_id == self.context.project_id,
-                        apply_locks.c.tenant_id == self.context.tenant_id,
-                    )
-                )
             existing = conn.execute(
                 select(apply_locks).where(
                     apply_locks.c.project_id == self.context.project_id,
@@ -128,22 +153,21 @@ class StateRepository:
                     tenant_id=self.context.tenant_id,
                     run_id=run_id,
                     acquired_at=timestamp,
-                    heartbeat_at=timestamp,
-                    expires_at=expires_at,
                 )
             )
 
-    def release_lock(self) -> None:
+    def release_lock(self, run_id: str) -> None:
         with self.begin() as conn:
             conn.execute(
                 delete(apply_locks).where(
                     apply_locks.c.project_id == self.context.project_id,
                     apply_locks.c.tenant_id == self.context.tenant_id,
+                    apply_locks.c.run_id == run_id,
                 )
             )
 
-    def create_run(self, manifest_hash: str) -> str:
-        run_id = new_id()
+    def create_run(self, manifest_hash: str, *, run_id: str | None = None) -> str:
+        run_id = run_id or new_id()
         timestamp = now()
         with self.begin() as conn:
             conn.execute(
@@ -392,74 +416,25 @@ class StateRepository:
         asset_name: str,
         source_name: str,
         source_item_key: str,
+        scope_fingerprint: str | None = None,
     ) -> list[MaterializedArtifact]:
+        query = (
+            select(asset_instances)
+            .where(
+                asset_instances.c.project_id == self.context.project_id,
+                asset_instances.c.tenant_id == self.context.tenant_id,
+                asset_instances.c.asset_name == asset_name,
+                asset_instances.c.source_name == source_name,
+                asset_instances.c.source_item_key == source_item_key,
+                asset_instances.c.status == "materialized",
+            )
+            .order_by(asset_instances.c.instance_key)
+        )
+        if scope_fingerprint is not None:
+            query = query.where(asset_instances.c.scope_fingerprint == scope_fingerprint)
         with self.engine.connect() as conn:
-            rows = conn.execute(
-                select(asset_instances)
-                .where(
-                    asset_instances.c.project_id == self.context.project_id,
-                    asset_instances.c.tenant_id == self.context.tenant_id,
-                    asset_instances.c.asset_name == asset_name,
-                    asset_instances.c.source_name == source_name,
-                    asset_instances.c.source_item_key == source_item_key,
-                    asset_instances.c.status == "materialized",
-                )
-                .order_by(asset_instances.c.instance_key)
-            ).mappings().all()
+            rows = conn.execute(query).mappings().all()
         return [_artifact_from_row(row) for row in rows]
-
-    def materialized_descendants_for_source_scope(
-        self,
-        root_id: str,
-        *,
-        asset_name: str,
-        source_name: str,
-        source_item_key: str,
-    ) -> list[MaterializedArtifact]:
-        with self.engine.connect() as conn:
-            rows = conn.execute(
-                select(asset_instances).where(
-                    asset_instances.c.project_id == self.context.project_id,
-                    asset_instances.c.tenant_id == self.context.tenant_id,
-                    asset_instances.c.source_name == source_name,
-                    asset_instances.c.source_item_key == source_item_key,
-                    asset_instances.c.status == "materialized",
-                )
-            ).mappings().all()
-            scoped_ids = [str(row["id"]) for row in rows]
-            if not scoped_ids:
-                return []
-            edges = conn.execute(
-                select(lineage_edges).where(
-                    lineage_edges.c.upstream_asset_instance_id.in_(scoped_ids),
-                    lineage_edges.c.downstream_asset_instance_id.in_(scoped_ids),
-                )
-            ).mappings().all()
-
-        by_id = {str(row["id"]): row for row in rows}
-        downstream_by_upstream: dict[str, list[str]] = {}
-        for edge in edges:
-            upstream_id = str(edge["upstream_asset_instance_id"])
-            downstream_id = str(edge["downstream_asset_instance_id"])
-            downstream_by_upstream.setdefault(upstream_id, []).append(downstream_id)
-
-        descendants: list[Any] = []
-        seen = {root_id}
-        queue = list(downstream_by_upstream.get(root_id, []))
-        while queue:
-            instance_id = queue.pop(0)
-            if instance_id in seen:
-                continue
-            seen.add(instance_id)
-            row = by_id.get(instance_id)
-            if row is None:
-                continue
-            if row["asset_name"] == asset_name:
-                descendants.append(row)
-            queue.extend(downstream_by_upstream.get(instance_id, []))
-
-        descendants.sort(key=lambda row: row["instance_key"])
-        return [_artifact_from_row(row) for row in descendants]
 
     def write_asset_instance(
         self,
@@ -474,6 +449,8 @@ class StateRepository:
         materialization_strategy: str,
         source_name: str | None = None,
         source_item_key: str | None = None,
+        scope_fingerprint: str | None = None,
+        artifact_collection: str = "local_json",
         metadata_value: dict[str, Any] | None = None,
     ) -> MaterializedArtifact:
         timestamp = now()
@@ -486,6 +463,8 @@ class StateRepository:
                 input_fingerprint_value=input_fingerprint_value,
                 source_name=source_name,
                 source_item_key=source_item_key,
+                scope_fingerprint=scope_fingerprint,
+                artifact_collection=artifact_collection,
                 output_location=output_location,
                 output_hash=output_hash,
                 content_hash=content_hash,
@@ -510,6 +489,8 @@ class StateRepository:
                     input_fingerprint_value=item.input_fingerprint,
                     source_name=item.source_name,
                     source_item_key=item.source_item_key,
+                    scope_fingerprint=item.scope_fingerprint,
+                    artifact_collection=item.artifact_collection,
                     output_location=item.output_location,
                     output_hash=item.output_hash,
                     content_hash=item.content_hash,
@@ -543,6 +524,8 @@ class StateRepository:
         input_fingerprint_value: str,
         source_name: str | None,
         source_item_key: str | None,
+        scope_fingerprint: str | None,
+        artifact_collection: str,
         output_location: str | None,
         output_hash: str | None,
         content_hash: str | None,
@@ -563,6 +546,8 @@ class StateRepository:
             "output_location": output_location,
             "source_name": source_name,
             "source_item_key": source_item_key,
+            "scope_fingerprint": scope_fingerprint,
+            "artifact_collection": artifact_collection,
             "output_hash": output_hash,
             "content_hash": content_hash,
             "transform_id": transform_id,
@@ -598,6 +583,8 @@ class StateRepository:
             input_fingerprint=input_fingerprint_value,
             source_name=source_name,
             source_item_key=source_item_key,
+            scope_fingerprint=scope_fingerprint,
+            artifact_collection=artifact_collection,
             output_location=output_location,
             output_hash=output_hash,
             content_hash=content_hash,
@@ -656,49 +643,6 @@ class StateRepository:
             rows = conn.execute(query).mappings().all()
         return [_artifact_from_row(row) for row in rows]
 
-    def materialized_descendants(
-        self,
-        root_id: str,
-        *,
-        asset_name: str | None = None,
-    ) -> list[MaterializedArtifact]:
-        with self.engine.connect() as conn:
-            rows = conn.execute(
-                select(asset_instances).where(
-                    asset_instances.c.project_id == self.context.project_id,
-                    asset_instances.c.tenant_id == self.context.tenant_id,
-                    asset_instances.c.status == "materialized",
-                )
-            ).mappings().all()
-            edges = conn.execute(select(lineage_edges)).mappings().all()
-
-        scoped_ids = {str(row["id"]) for row in rows}
-        by_id = {str(row["id"]): row for row in rows}
-        downstream_by_upstream: dict[str, list[str]] = {}
-        for edge in edges:
-            upstream_id = str(edge["upstream_asset_instance_id"])
-            downstream_id = str(edge["downstream_asset_instance_id"])
-            if upstream_id in scoped_ids and downstream_id in scoped_ids:
-                downstream_by_upstream.setdefault(upstream_id, []).append(downstream_id)
-
-        descendants: list[Any] = []
-        seen = {root_id}
-        queue = list(downstream_by_upstream.get(root_id, []))
-        while queue:
-            instance_id = queue.pop(0)
-            if instance_id in seen:
-                continue
-            seen.add(instance_id)
-            row = by_id.get(instance_id)
-            if row is None:
-                continue
-            if asset_name is None or row["asset_name"] == asset_name:
-                descendants.append(row)
-            queue.extend(downstream_by_upstream.get(instance_id, []))
-
-        descendants.sort(key=lambda row: (row["asset_name"], row["instance_key"]))
-        return [_artifact_from_row(row) for row in descendants]
-
     def _write_lineage(self, conn: Connection, upstream_id: str, downstream_id: str) -> None:
         exists = conn.execute(
             select(lineage_edges).where(
@@ -713,6 +657,58 @@ class StateRepository:
                     downstream_asset_instance_id=downstream_id,
                 )
             )
+
+    def upsert_asset_scope_completions(
+        self,
+        asset_name: str,
+        completions: dict[tuple[str, str, str], int],
+    ) -> None:
+        if not completions:
+            return
+        timestamp = now()
+        with self.begin() as conn:
+            for (source_name, source_item_key, scope_fingerprint), count in completions.items():
+                row = conn.execute(
+                    select(asset_scope_completions).where(
+                        asset_scope_completions.c.project_id == self.context.project_id,
+                        asset_scope_completions.c.tenant_id == self.context.tenant_id,
+                        asset_scope_completions.c.asset_name == asset_name,
+                        asset_scope_completions.c.source_name == source_name,
+                        asset_scope_completions.c.source_item_key == source_item_key,
+                        asset_scope_completions.c.scope_fingerprint == scope_fingerprint,
+                    )
+                ).first()
+                values = {
+                    "expected_instance_count": str(count),
+                    "status": "complete",
+                    "updated_at": timestamp,
+                }
+                if row:
+                    conn.execute(
+                        update(asset_scope_completions)
+                        .where(
+                            asset_scope_completions.c.project_id == self.context.project_id,
+                            asset_scope_completions.c.tenant_id == self.context.tenant_id,
+                            asset_scope_completions.c.asset_name == asset_name,
+                            asset_scope_completions.c.source_name == source_name,
+                            asset_scope_completions.c.source_item_key == source_item_key,
+                            asset_scope_completions.c.scope_fingerprint == scope_fingerprint,
+                        )
+                        .values(**values)
+                    )
+                else:
+                    conn.execute(
+                        insert(asset_scope_completions).values(
+                            project_id=self.context.project_id,
+                            tenant_id=self.context.tenant_id,
+                            asset_name=asset_name,
+                            source_name=source_name,
+                            source_item_key=source_item_key,
+                            scope_fingerprint=scope_fingerprint,
+                            created_at=timestamp,
+                            **values,
+                        )
+                    )
 
     def upsert_source_state(self, source_name: str, item_key: str, content_hash: str) -> None:
         timestamp = now()
@@ -766,8 +762,7 @@ class StateRepository:
                 .values(deleted_at=now())
             )
 
-    def mark_lineage_deleted_for_source(self, source_item_key: str) -> int:
-        like_prefix = f"{source_item_key}#%"
+    def mark_lineage_deleted_for_source(self, source_name: str, source_item_key: str) -> int:
         with self.begin() as conn:
             result = conn.execute(
                 update(asset_instances)
@@ -775,10 +770,8 @@ class StateRepository:
                     asset_instances.c.project_id == self.context.project_id,
                     asset_instances.c.tenant_id == self.context.tenant_id,
                     asset_instances.c.status == "materialized",
-                    or_(
-                        asset_instances.c.instance_key.op("GLOB")(f"{source_item_key}#*"),
-                        asset_instances.c.instance_key == source_item_key,
-                    ),
+                    asset_instances.c.source_name == source_name,
+                    asset_instances.c.source_item_key == source_item_key,
                 )
                 .values(status="deleted", updated_at=now())
             )
@@ -786,11 +779,20 @@ class StateRepository:
                 delete(vector_sink).where(
                     vector_sink.c.project_id == self.context.project_id,
                     vector_sink.c.tenant_id == self.context.tenant_id,
-                    or_(
-                        vector_sink.c.instance_key == source_item_key,
-                        vector_sink.c.instance_key.like(like_prefix),
-                    ),
+                    vector_sink.c.source_name == source_name,
+                    vector_sink.c.source_item_key == source_item_key,
                 )
+            )
+            conn.execute(
+                update(asset_scope_completions)
+                .where(
+                    asset_scope_completions.c.project_id == self.context.project_id,
+                    asset_scope_completions.c.tenant_id == self.context.tenant_id,
+                    asset_scope_completions.c.source_name == source_name,
+                    asset_scope_completions.c.source_item_key == source_item_key,
+                    asset_scope_completions.c.status == "complete",
+                )
+                .values(status="deleted", updated_at=now())
             )
             return int(result.rowcount or 0)
 
@@ -850,6 +852,7 @@ class StateRepository:
                 {
                     "instance_key": instance_key,
                     "embedding_fingerprint": embedding_fingerprint,
+                    "source_name": "",
                     "source_item_key": source_item_key,
                     "chunk_text": chunk_text,
                     "embedding": embedding,
@@ -867,6 +870,7 @@ class StateRepository:
                     select(vector_sink).where(
                         vector_sink.c.project_id == self.context.project_id,
                         vector_sink.c.tenant_id == self.context.tenant_id,
+                        vector_sink.c.source_name == str(item["source_name"]),
                         vector_sink.c.instance_key == str(item["instance_key"]),
                         vector_sink.c.embedding_fingerprint
                         == str(item["embedding_fingerprint"]),
@@ -884,6 +888,7 @@ class StateRepository:
                         .where(
                             vector_sink.c.project_id == self.context.project_id,
                             vector_sink.c.tenant_id == self.context.tenant_id,
+                            vector_sink.c.source_name == str(item["source_name"]),
                             vector_sink.c.instance_key == str(item["instance_key"]),
                             vector_sink.c.embedding_fingerprint
                             == str(item["embedding_fingerprint"]),
@@ -895,6 +900,7 @@ class StateRepository:
                         insert(vector_sink).values(
                             project_id=self.context.project_id,
                             tenant_id=self.context.tenant_id,
+                            source_name=str(item["source_name"]),
                             instance_key=str(item["instance_key"]),
                             embedding_fingerprint=str(item["embedding_fingerprint"]),
                             **values,

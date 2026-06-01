@@ -37,11 +37,4 @@ class OperationWindowResult:
 
 
 class OperationRunner(Protocol):
-    async def run(self, invocation: OperationInvocation) -> list[OperationOutput]: ...
-
-    async def run_many(
-        self,
-        invocations: list[OperationInvocation],
-    ) -> list[list[OperationOutput]]: ...
-
     async def run_window(self, window: OperationWindow) -> OperationWindowResult: ...
