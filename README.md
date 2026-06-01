@@ -10,6 +10,8 @@ adapters, and local execution runners.
 
 ## What It Looks Like
 
+![Example Strata lineage graph](docs/lineage.png)
+
 ```yaml
 sources:
   docs:

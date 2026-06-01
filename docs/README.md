@@ -5,5 +5,6 @@ evolving.
 
 - [Architecture decisions](adr.md)
 - [Implementation plan](implementation-plan.md)
+- [Project overview](overview.html)
 
 The issue-triage notes used during early design review are intentionally not kept here.
