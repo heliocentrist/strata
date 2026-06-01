@@ -99,3 +99,7 @@ Strata is not production-ready. The core contracts are still evolving around dur
 execution, artifact storage, external sinks, and plugin discovery. The immediate goal is
 to keep the core small while making sources, operations, artifact collections, sinks, and
 execution runners pluggable.
+
+## License
+
+MIT
